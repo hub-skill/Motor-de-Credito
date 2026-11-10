@@ -1,0 +1,15 @@
+# Segredos: nunca versionar
+.env
+
+# Ambiente e caches de ferramentas
+.venv/
+__pycache__/
+*.pyc
+.coverage
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Dados baixados da CGU (públicos, mas grandes e regeráveis com banco/carregar_cgu.py)
+dados_cgu/
