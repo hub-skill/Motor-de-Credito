@@ -4,18 +4,13 @@ Windows: o psycopg async não funciona com o ProactorEventLoop. Rode o uvicorn c
 --loop asyncio:SelectorEventLoop (ver README).
 """
 
-import logging
 from datetime import datetime
 
-import psycopg
-from psycopg import errors as pgerr
-from psycopg_pool import AsyncConnectionPool, PoolTimeout
+from psycopg_pool import AsyncConnectionPool
 
 from app.core.config import Settings
-from app.core.exceptions import BancoExpirou, BancoIndisponivel
 from app.repositorios.base import SQL_ORIGEM, SQL_PEPS, SQL_SANCOES, OrigemDados, RegistroPep, Sancao
-
-logger = logging.getLogger(__name__)
+from app.repositorios.erros_postgres import traduzir_erros_postgres
 
 
 class RepositorioPostgres:
@@ -44,16 +39,10 @@ class RepositorioPostgres:
         return cls(pool)
 
     async def _consultar(self, sql: str, params: tuple[object, ...]) -> list[tuple[object, ...]]:
-        try:
+        with traduzir_erros_postgres():
             async with self._pool.connection() as conn:
                 cur = await conn.execute(sql, params)
                 return await cur.fetchall()
-        except pgerr.QueryCanceled as exc:  # 57014: statement_timeout
-            raise BancoExpirou() from exc
-        except (PoolTimeout, psycopg.OperationalError) as exc:
-            # Nunca logar exc.pgconn: contém a senha.
-            logger.error("postgres indisponível", extra={"erro": type(exc).__name__})
-            raise BancoIndisponivel() from exc
 
     async def buscar_sancoes(self, documento: str) -> list[Sancao]:
         linhas = await self._consultar(SQL_SANCOES.format(tabela="credito.sancoes", param="%s"), (documento,))

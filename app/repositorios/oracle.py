@@ -1,17 +1,12 @@
 """Repositório Oracle (python-oracledb thin, async + pool). MOTOR_APP lê pelos sinônimos."""
 
-import logging
 from datetime import datetime
 
 import oracledb
 
 from app.core.config import Settings
-from app.core.exceptions import BancoExpirou, BancoIndisponivel
 from app.repositorios.base import SQL_ORIGEM, SQL_PEPS, SQL_SANCOES, OrigemDados, RegistroPep, Sancao
-
-logger = logging.getLogger(__name__)
-
-_INDISPONIVEL = {"DPY-6005", "DPY-6000", "DPY-4011", "ORA-03113", "ORA-12541", "ORA-12514"}
+from app.repositorios.erros_oracle import traduzir_erros_oracle
 
 
 def _para_date(valor: object) -> object:
@@ -40,22 +35,13 @@ class RepositorioOracle:
         return cls(pool, s.oracle_call_timeout_ms)
 
     async def _consultar(self, sql: str, params: dict[str, object]) -> list[tuple[object, ...]]:
-        try:
+        with traduzir_erros_oracle():
             async with self._pool.acquire() as conn:
                 conn.call_timeout = self._timeout
                 with conn.cursor() as cur:
                     await cur.execute(sql, params)
                     linhas: list[tuple[object, ...]] = await cur.fetchall()
                     return linhas
-        except oracledb.Error as exc:
-            (err,) = exc.args
-            codigo = getattr(err, "full_code", type(exc).__name__)
-            logger.error("erro oracle", extra={"codigo_oracle": codigo})
-            if codigo == "DPY-4024":  # call_timeout estourado
-                raise BancoExpirou() from exc
-            if codigo in _INDISPONIVEL or codigo.startswith("DPY-6") or codigo == "DPY-4005":
-                raise BancoIndisponivel() from exc
-            raise
 
     async def buscar_sancoes(self, documento: str) -> list[Sancao]:
         linhas = await self._consultar(

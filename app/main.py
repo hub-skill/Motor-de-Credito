@@ -8,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+from prometheus_fastapi_instrumentator import Instrumentator
 from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -109,13 +110,22 @@ async def tratar_erro_de_dominio(request: Request, exc: ErroDeDominio) -> JSONRe
 
 @app.exception_handler(RequestValidationError)
 async def tratar_erro_de_validacao(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # JSON malformado é erro de requisição (400), não de conteúdo (422).
+    if any(erro.get("type") == "json_invalid" for erro in exc.errors()):
+        return _resposta_erro(request, 400, "requisicao_invalida", "Requisição inválida.")
     # Mensagem genérica: os detalhes do Pydantic ecoariam a entrada (CPF, nome).
     return _resposta_erro(request, 422, "entrada_invalida", "Dados de entrada inválidos.")
 
 
 @app.exception_handler(RateLimitExceeded)
 async def tratar_rate_limit(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    return _resposta_erro(request, 429, "limite_excedido", "Muitas requisições. Tente mais tarde.")
+    return _resposta_erro(
+        request,
+        429,
+        "limite_excedido",
+        "Muitas requisições. Tente mais tarde.",
+        headers={"Retry-After": "60"},
+    )
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -151,5 +161,8 @@ async def ready(request: Request) -> JSONResponse:
         return JSONResponse(status_code=503, content={"status": "banco_indisponivel"})
     return JSONResponse(status_code=200, content={"status": "ok", "banco": settings.motor_banco})
 
+
+# Métricas Prometheus (latência, requisições, erros). Exponha /metrics só na rede interna.
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 app.include_router(router_v1)

@@ -79,8 +79,8 @@ uv run python banco/conferir_carga.py        # compara PostgreSQL x Oracle
 ```powershell
 uv run ruff check . ; uv run ruff format --check app tests
 uv run mypy app
-uv run pytest                                              # sem banco (repositório falso)
-uv run pytest -m "bancos or not bancos" --cov-fail-under=85  # inclui PostgreSQL e Oracle reais
+uv run pytest                                              # sem banco: repositório falso + falhas com porta fechada
+uv run pytest -m "bancos or not bancos" --cov-fail-under=95  # inclui PostgreSQL e Oracle reais
 uv run bandit -r app ; uv run pip-audit
 ```
 
@@ -90,12 +90,17 @@ Formato único: `{"error": {"code", "message", "request_id"}}`.
 
 | Status | Código | Quando |
 |---|---|---|
+| 400 | `requisicao_invalida` | JSON malformado |
 | 401 | `http_401` | `X-API-Key` ausente ou inválida |
 | 413 | `corpo_muito_grande` | Corpo maior que 4 KB |
 | 422 | `entrada_invalida` | CPF/CNPJ inválido ou nome com caracteres de controle |
 | 429 | `limite_excedido` | Rate limit |
-| 503 | `banco_indisponivel` | Banco fora do ar |
+| 500 | `erro_interno` | Erro inesperado (detalhes só no log, pelo `request_id`) |
+| 503 | `banco_indisponivel` | Banco fora do ar, senha errada ou pool esgotado |
 | 504 | `timeout` / `banco_timeout` | Tempo limite excedido |
+
+Documentação completa de uso: [DOCUMENTACAO.md](DOCUMENTACAO.md). Métricas Prometheus em `/metrics`
+(exponha só na rede interna).
 
 ## Estrutura
 
@@ -105,6 +110,8 @@ app/
   services/documentos.py   validação CPF/CNPJ (inclusive alfanumérico)
   services/triagem.py      regra de decisão (função pura)
   repositorios/            postgres.py e oracle.py (mesma interface, base.py)
+                           erros_postgres.py / erros_oracle.py: falha de banco = 503/504, nunca 500
 banco/                     scripts: criar tabelas, carga da CGU, conferências
-tests/unit, tests/integration (sem banco), tests/bancos (bancos reais, -m bancos)
+tests/unit, tests/integration (sem banco), tests/falhas (drivers reais, porta fechada),
+tests/bancos (bancos reais, -m bancos)
 ```
