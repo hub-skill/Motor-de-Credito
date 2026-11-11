@@ -30,7 +30,7 @@ jobs:
           uv run ruff format --check app tests
 
       - name: Tipos (mypy estrito)
-        run: uv run mypy app
+        run: uv run mypy app tests
 
       # Sem bancos: os repositórios reais ficam para "pytest -m bancos", rodado localmente.
       - name: Testes (pytest)

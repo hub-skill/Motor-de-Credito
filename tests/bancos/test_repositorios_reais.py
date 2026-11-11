@@ -27,7 +27,7 @@ CNPJ_SANCIONADO = "19182685000162"  # Declaração de Inidoneidade (CEIS), publi
 
 
 def _settings() -> Settings:
-    return Settings(**{**ENV, "api_key": os.environ["API_KEY"]})
+    return Settings.model_validate({**ENV, "api_key": os.environ["API_KEY"]})
 
 
 @pytest_asyncio.fixture(params=["postgres", "oracle"])
