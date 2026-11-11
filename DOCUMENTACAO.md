@@ -374,6 +374,45 @@ Observações:
 - Não foi preciso mexer no `pg_hba.conf` nem no listener do Oracle nesta máquina. Se der `no pg_hba.conf entry
   for host "x.x.x.x"`, libere a faixa do Docker (192.168.65.0/24) para o usuário da aplicação.
 
+### Rodar no Kubernetes
+
+Validado em 11/11/2026 no Kubernetes v1.36.1 do Docker Desktop (modo kind), com os bancos no Windows. Os
+manifestos ficam em `k8s/` (Kustomize: `base/` e `overlays/local`, `overlays/producao`). Precisa da imagem do
+passo anterior e do `.env.docker`.
+
+```powershell
+# 1) Gerar k8s/ (config.env e segredos.env saem do .env.docker; segredos.env está no .gitignore)
+& "$HOME\.claude\skills\kubernetes\scripts\preparar-k8s.ps1" -Projeto . -Nome motor-credito-py -Linguagem python
+
+# 2) Modo kind (nó "desktop-control-plane"): levar a imagem ao nó. Rode no bash (o pipe do PowerShell 5.1 corrompe o tar)
+docker save motor-credito-py:0.1.0 | docker exec -i desktop-control-plane ctr -n k8s.io images import --all-platforms -
+
+# 3) Publicar e conferir
+kubectl apply -f k8s/overlays/local/namespace.yaml
+kubectl apply -k k8s/overlays/local
+kubectl -n motor-credito-py rollout status deploy/motor-credito-py --timeout=180s
+kubectl -n motor-credito-py get pods                      # 1/1 Running, RESTARTS 0
+
+# 4) Acessar (http://localhost:9081)
+kubectl -n motor-credito-py port-forward svc/motor-credito-py 9081:80
+
+# Remover
+kubectl delete -k k8s/overlays/local
+```
+
+Resultados da validação: triagem real igual à do container; `rollout restart` com tráfego contínuo pelo Service,
+622 chamadas e 0 falhas; versão com o banco inacessível nunca fica pronta e o pod antigo segue atendendo, sem
+reinícios.
+
+- Cada mudança de código pede **tag nova** (`0.1.1`): importe a imagem e troque o `newTag` em
+  `k8s/overlays/local/kustomization.yaml` (ou passe `-Tag` ao script).
+- O rate limit (`RATE_LIMIT`) é **por pod** e em memória: com N réplicas o limite real é N vezes maior. No Python,
+  só a rota `/api/v1/triagem` tem limite; `/health/*` não.
+- Com o banco fora, o `/health/ready` demora cerca de 5 s (espera do pool) e a readiness tem prazo de 3 s: o
+  kubelet registra `context deadline exceeded` em vez de 503. O efeito é o mesmo: o pod sai do Service.
+- Conexões no banco = réplicas × `PG_POOL_MAX`. No overlay `local` há 1 réplica; o HPA (2 a 6) só existe na `base`
+  e no `producao`. O Docker Desktop não traz metrics-server nem aplica NetworkPolicy.
+
 ### Monitoramento
 
 - `/health/ready` no balanceador/orquestrador (tira a instância de rotação se o banco cair).
