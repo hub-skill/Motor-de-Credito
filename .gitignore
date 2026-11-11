@@ -1,5 +1,6 @@
 # Segredos: nunca versionar
 .env
+.env.docker
 
 # Ambiente e caches de ferramentas
 .venv/

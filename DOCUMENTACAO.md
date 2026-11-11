@@ -330,15 +330,49 @@ uv run python banco/conferir_carga.py    # compara PostgreSQL x Oracle
 Agende o `carregar_cgu.py` uma vez por dia (CEIS e CNEP mudam diariamente). A API guarda a `fonte` em cache por
 5 minutos; depois de uma carga, as respostas passam a mostrar os arquivos novos em até 5 minutos.
 
-### Produção
+### Rodar em container (Docker)
 
-```
-gunicorn app.main:app -k uvicorn_worker.UvicornWorker -w 2 -b 0.0.0.0:8000 --timeout 15 --graceful-timeout 15 --keep-alive 5
+Validado em 11/11/2026 com Docker Desktop 29.9.3 no Windows, com PostgreSQL e Oracle rodando no próprio
+Windows. Imagem final: 355 MB, usuário não root (UID 10001) e zero vulnerabilidades HIGH/CRITICAL corrigíveis
+(trivy 0.58.1).
+
+```powershell
+cd "C:\Felipe\Programacao\Python\APIs\Motor de credito"
+
+# 1) Construir a imagem (o .dockerignore deixa .env, .venv, tests e dados fora)
+docker build -t motor-credito-py:0.1.0 .
+
+# 2) Arquivo de variáveis do container: o .env sem os administradores e com o banco em host.docker.internal
+#    (dentro do container, "localhost" é o próprio container). O .env.docker está no .gitignore.
+$l = Get-Content .env -Encoding utf8 | Where-Object { $_.Trim() -and $_ -notmatch '^\s*#' -and $_ -notmatch '^PG_ADMIN_|^ORACLE_ADMIN_' } |
+  ForEach-Object { $_ -replace '^PG_HOST=.*','PG_HOST=host.docker.internal' -replace '^(ORACLE_DSN=)(localhost|127\.0\.0\.1)','${1}host.docker.internal' }
+[IO.File]::WriteAllLines("$PWD\.env.docker", [string[]]$l)   # UTF-8 sem BOM (o Set-Content do PowerShell 5.1 grava BOM)
+
+# 3) Subir (porta 8081 do Windows -> 8080 do container)
+docker run -d --name motor-py -p 8081:8080 --env-file .env.docker motor-credito-py:0.1.0
+#    Para consultar o Oracle: acrescente  -e MOTOR_BANCO=oracle
+
+# 4) Conferir
+curl.exe http://localhost:8081/health/ready      # {"status":"ok","banco":"postgres"}
+docker logs motor-py --tail 20
+
+# Parar / remover
+docker rm -f motor-py
 ```
 
-(é o `CMD` do `Dockerfile`). Escala de tempos: banco (5 s) < requisição (`REQUEST_TIMEOUT_SECONDS=10`) <
-gunicorn (15 s) < proxy. No Linux o loop padrão já funciona com o psycopg async; o `--loop` só é exigido no
-Windows.
+Observações:
+
+- No Linux o loop padrão já funciona com o psycopg async; o `--loop asyncio:SelectorEventLoop` só é exigido no
+  Windows.
+- `WEB_CONCURRENCY=1` (um processo por container): no Kubernetes quem escala são as réplicas. Fora dele, aumente
+  com `-e WEB_CONCURRENCY=2`; cada processo abre o próprio pool e o próprio rate limit.
+- Escala de tempos: banco (5 s) < requisição (`REQUEST_TIMEOUT_SECONDS=10`) < gunicorn `--timeout` (15 s) <
+  `--graceful-timeout` (20 s) < proxy.
+- Com o banco inacessível, `/health/live` continua 200, `/health/ready` dá 503 e a triagem responde
+  `503 banco_indisponivel` em cerca de 5 s (espera do pool).
+- O `Dockerfile` aplica as atualizações de segurança do Debian: reconstrua a imagem periodicamente.
+- Não foi preciso mexer no `pg_hba.conf` nem no listener do Oracle nesta máquina. Se der `no pg_hba.conf entry
+  for host "x.x.x.x"`, libere a faixa do Docker (192.168.65.0/24) para o usuário da aplicação.
 
 ### Monitoramento
 
