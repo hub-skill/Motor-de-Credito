@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,10 +12,10 @@ class Settings(BaseSettings):
 
     # --- Esta API ---
     app_env: str = "dev"  # dev | staging | prod
-    api_key: SecretStr  # sem valor padrão: a aplicação não sobe sem ela
+    api_key: SecretStr = Field(..., min_length=32)  # sem valor padrão: a aplicação não sobe sem ela
     allowed_origins: list[str] = []
     allowed_hosts: list[str] = ["localhost", "127.0.0.1"]
-    request_timeout_seconds: float = 10.0
+    request_timeout_seconds: float = Field(10.0, gt=0, le=60)
     enable_docs: bool = False
     rate_limit: str = "60/minute"
 

@@ -14,6 +14,7 @@ dependencies = [
   "psycopg-pool>=3.2",
   "oracledb>=2.0",
   "python-dotenv>=1.0",
+  "prometheus-fastapi-instrumentator>=7.0",
 ]
 
 [dependency-groups]
@@ -62,6 +63,6 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["."]
 markers = ["bancos: testes contra os bancos reais (PostgreSQL e Oracle); rode com -m bancos"]
-# Sem bancos (padrão/CI): repositórios ficam de fora, mínimo 80%.
-# Completo, com os bancos reais: pytest -m "bancos or not bancos" --cov-fail-under=85  (hoje: 92%)
-addopts = "-m 'not bancos' --cov=app --cov-report=term-missing --cov-fail-under=80"
+# Sem bancos (padrão/CI): falhas de banco simuladas com porta fechada (tests/falhas), mínimo 90% (hoje: 94%).
+# Completo, com os bancos reais: pytest -m "bancos or not bancos" --cov-fail-under=95  (hoje: 99%)
+addopts = "-m 'not bancos' --cov=app --cov-report=term-missing --cov-fail-under=90"
