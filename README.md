@@ -86,12 +86,14 @@ uv run bandit -r app ; uv run pip-audit
 
 ## Erros
 
-Formato único: `{"error": {"code", "message", "request_id"}}`.
+Formato único, o mesmo do Motor .NET: **RFC 9457 (Problem Details)**, `Content-Type: application/problem+json`, com
+exatamente `title`, `status`, `code` e `request_id`.
 
 | Status | Código | Quando |
 |---|---|---|
 | 400 | `requisicao_invalida` | JSON malformado |
 | 401 | `http_401` | `X-API-Key` ausente ou inválida |
+| 404 / 405 | `http_404` / `http_405` | Rota inexistente / método não permitido |
 | 413 | `corpo_muito_grande` | Corpo maior que 4 KB |
 | 422 | `entrada_invalida` | CPF/CNPJ inválido ou nome com caracteres de controle |
 | 429 | `limite_excedido` | Rate limit |

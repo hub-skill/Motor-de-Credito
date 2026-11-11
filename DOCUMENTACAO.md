@@ -254,17 +254,27 @@ Mantenha `REQUEST_TIMEOUT_SECONDS` **maior** que a espera do pool (5 s): com o b
 
 ## 6. Erros
 
-Formato único, sempre com `code` e `request_id`:
+Formato único, **o mesmo do Motor .NET**: RFC 9457 (Problem Details), com `Content-Type: application/problem+json` e
+exatamente quatro campos: `title` (texto para pessoas), `status` (o mesmo código HTTP), `code` (para o seu programa
+decidir o que fazer) e `request_id`:
 
 ```json
-{ "error": { "code": "entrada_invalida", "message": "Dados de entrada inválidos.", "request_id": "b6f3799f-e6d9-4a3e-a898-3cce7d4863eb" } }
+{
+  "title": "Dados de entrada inválidos.",
+  "status": 422,
+  "code": "entrada_invalida",
+  "request_id": "b6f3799f-e6d9-4a3e-a898-3cce7d4863eb"
+}
 ```
+
+Decida sempre pelo `code` (ou pelo `status`), nunca pelo texto do `title`, que pode ser reescrito.
 
 | HTTP | `code` | Quando | O cliente deve |
 |---|---|---|---|
 | 400 | `requisicao_invalida` | JSON malformado | Corrigir o corpo |
 | 401 | `http_401` | Sem `X-API-Key` ou chave errada | Conferir a chave |
 | 404 | `http_404` | Rota inexistente | Conferir a URL |
+| 405 | `http_405` | Método não permitido (a triagem é só `POST`) | Usar `POST` |
 | 413 | `corpo_muito_grande` | Corpo acima de 4 KB | Reduzir o corpo |
 | 422 | `entrada_invalida` | CPF/CNPJ inválido, campo ausente ou nome com caracteres de controle | Corrigir; **não repetir** |
 | 429 | `limite_excedido` | Limite de requisições | Esperar `Retry-After` |
