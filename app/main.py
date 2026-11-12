@@ -12,6 +12,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api.deps import chave_valida
 from app.api.v1.routes import router as router_v1
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ErroDeDominio
@@ -142,6 +143,9 @@ async def tratar_rate_limit(request: Request, exc: RateLimitExceeded) -> JSONRes
 
 @app.exception_handler(StarletteHTTPException)
 async def tratar_erro_http(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    # Rota inexistente ou método errado SEM chave válida: 401, como no Motor .NET (não revela quais rotas existem).
+    if exc.status_code in (404, 405) and not chave_valida(request.headers.get("X-API-Key"), get_settings()):
+        return _resposta_erro(request, 401, "http_401", _TITULOS_HTTP[401], headers={"WWW-Authenticate": "APIKey"})
     return _resposta_erro(
         request,
         exc.status_code,

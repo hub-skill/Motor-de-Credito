@@ -115,7 +115,8 @@ Resultado esperado: `resultado = bloquear`, motivo `S01` (CNPJ com declaração 
 ### Autenticação
 
 A rota de triagem exige o header `X-API-Key: <valor de API_KEY>`. A chave é comparada em tempo constante.
-Sem chave ou com chave errada: **401** (com `WWW-Authenticate: APIKey`).
+Sem chave ou com chave errada: **401** (com `WWW-Authenticate: APIKey`). Sem chave, até rotas inexistentes e métodos
+errados respondem 401, como no Motor .NET: a API não revela quais rotas existem.
 
 ### `POST /api/v1/triagem`
 
@@ -273,7 +274,7 @@ Decida sempre pelo `code` (ou pelo `status`), nunca pelo texto do `title`, que p
 |---|---|---|---|
 | 400 | `requisicao_invalida` | JSON malformado | Corrigir o corpo |
 | 401 | `http_401` | Sem `X-API-Key` ou chave errada | Conferir a chave |
-| 404 | `http_404` | Rota inexistente | Conferir a URL |
+| 404 | `http_404` | Rota inexistente (com chave válida) | Conferir a URL |
 | 405 | `http_405` | Método não permitido (a triagem é só `POST`) | Usar `POST` |
 | 413 | `corpo_muito_grande` | Corpo acima de 4 KB | Reduzir o corpo |
 | 422 | `entrada_invalida` | CPF/CNPJ inválido, campo ausente ou nome com caracteres de controle | Corrigir; **não repetir** |

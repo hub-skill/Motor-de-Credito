@@ -33,6 +33,16 @@ async def test_rota_inexistente_responde_404_no_formato_padrao(cliente: AsyncCli
     afirmar_problema(await cliente.get("/nao-existe", headers=CABECALHOS), 404, "http_404")
 
 
+@pytest.mark.parametrize(("metodo", "rota"), [("GET", "/nao-existe"), ("GET", URL)])
+async def test_sem_chave_rota_inexistente_ou_metodo_errado_responde_401(
+    cliente: AsyncClient, metodo: str, rota: str
+) -> None:
+    # Igual ao Motor .NET: sem chave, a API não revela quais rotas existem.
+    resposta = await cliente.request(metodo, rota)
+    afirmar_problema(resposta, 401, "http_401")
+    assert resposta.headers["www-authenticate"] == "APIKey"
+
+
 async def test_metodo_errado_responde_405_no_formato_padrao(cliente: AsyncClient) -> None:
     resposta = await cliente.get(URL, headers=CABECALHOS)
     afirmar_problema(resposta, 405, "http_405")
@@ -105,7 +115,8 @@ async def test_ready_sem_repositorio_responde_503(cliente: AsyncClient) -> None:
 
 async def test_documentacao_desligada_por_padrao(cliente: AsyncClient) -> None:
     for rota in ("/docs", "/redoc", "/openapi.json"):
-        assert (await cliente.get(rota)).status_code == 404
+        assert (await cliente.get(rota, headers=CABECALHOS)).status_code == 404
+        assert (await cliente.get(rota)).status_code == 401  # sem chave não revela que a rota não existe
 
 
 async def test_documentacao_ligada_e_publica(monkeypatch: pytest.MonkeyPatch) -> None:
