@@ -17,7 +17,7 @@ from psycopg_pool import PoolTimeout
 import app.main as modulo_main
 from app.core.config import Settings, get_settings
 from app.core.exceptions import BancoExpirou, BancoIndisponivel
-from app.repositorios.base import RegistroErro
+from app.repositorios.base import RegistroErro, RegistroResposta
 from app.repositorios.erros_oracle import oracle_codigo_do_erro, oracle_indisponivel, traduzir_erros_oracle
 from app.repositorios.erros_postgres import pg_erro_de_conexao, traduzir_erros_postgres
 from app.repositorios.oracle import RepositorioOracle
@@ -56,7 +56,10 @@ async def test_repositorio_oracle_fora_do_ar_vira_banco_indisponivel() -> None:
         await repo.fechar()
 
 
-_REGISTRO = RegistroErro("r1", "POST", "/api/v1/triagem", 503, "banco_indisponivel", "Banco fora.", None, 1, "dev")
+_REGISTRO = RegistroErro(
+    2026, 1, "r1", "POST", "/api/v1/triagem", 503, "banco_indisponivel", "Banco fora.", None, 1, "dev"
+)
+_RESPOSTA = RegistroResposta(2026, 1, 503, "{}", "OK", "ER")
 
 
 async def test_log_de_erros_com_banco_fora_vira_banco_indisponivel() -> None:
@@ -65,6 +68,18 @@ async def test_log_de_erros_com_banco_fora_vira_banco_indisponivel() -> None:
         try:
             with pytest.raises(BancoIndisponivel):
                 await repo.gravar_erros([_REGISTRO])
+        finally:
+            await repo.fechar()
+
+
+async def test_movimentacao_com_banco_fora_vira_banco_indisponivel() -> None:
+    # Numerar a chegada e gravar a resposta com o banco fora: exceção traduzida, nunca o erro cru do driver.
+    for repo in (await RepositorioPostgres.criar(_settings()), await RepositorioOracle.criar(_settings())):
+        try:
+            with pytest.raises(BancoIndisponivel):
+                await repo.registrar_requisicao("POST", "/api/v1/triagem", "{}")
+            with pytest.raises(BancoIndisponivel):
+                await repo.registrar_respostas([_RESPOSTA])
         finally:
             await repo.fechar()
 

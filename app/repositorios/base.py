@@ -36,8 +36,13 @@ class OrigemDados:
 
 @dataclass(frozen=True)
 class RegistroErro:
-    """Uma resposta de erro da API, para a tabela log_erros. Só metadados: nunca documento, nome ou corpo."""
+    """Uma resposta de erro da API, para a tabela log_erros. Só metadados: nunca documento, nome ou corpo.
 
+    ``ano`` e ``requisicao`` apontam para a movimentação: sem eles o erro não é gravado (vai só para o log).
+    """
+
+    ano: int
+    requisicao: int
     request_id: str
     metodo: str
     rota: str
@@ -47,6 +52,18 @@ class RegistroErro:
     tipo_excecao: str | None
     duracao_ms: int | None
     ambiente: str
+
+
+@dataclass(frozen=True)
+class RegistroResposta:
+    """Resposta da API para completar a linha da movimentação (conteúdo já mascarado e limitado)."""
+
+    ano: int
+    requisicao: int
+    status_http: int
+    conteudo: str | None
+    situacao_requisicao: str  # OK = aceita; ER = recusada (4xx)
+    situacao_resposta: str  # OK = sucesso (2xx); ER = erro (4xx/5xx)
 
 
 class RepositorioListas(Protocol):
@@ -64,6 +81,14 @@ class RepositorioListas(Protocol):
         """Grava um lote na tabela log_erros (a aplicação só tem INSERT nela)."""
         ...
 
+    async def registrar_requisicao(self, metodo: str, rota: str, conteudo: str | None) -> tuple[int, int]:
+        """Numera a requisição no ano e grava a chegada na movimentação. Devolve (ano, requisicao)."""
+        ...
+
+    async def registrar_respostas(self, registros: list[RegistroResposta]) -> None:
+        """Completa as linhas da movimentação com as respostas (cada linha uma vez só)."""
+        ...
+
     async def fechar(self) -> None: ...
 
 
@@ -79,7 +104,8 @@ SQL_PEPS = (
     " from {tabela} where cpf_miolo = {param}"
 )
 SQL_LOG_ERROS = (
-    "insert into {tabela} (request_id, metodo, rota, status, codigo, titulo, tipo_excecao, duracao_ms, ambiente)"
+    "insert into {tabela} (ano, requisicao, request_id, metodo, rota, status, codigo, titulo, tipo_excecao,"
+    " duracao_ms, ambiente)"
     " values ({params})"
 )
 SQL_ORIGEM = "select arquivo_origem, max(carregado_em) from {tabela} group by arquivo_origem"

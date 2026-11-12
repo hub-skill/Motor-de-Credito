@@ -11,7 +11,7 @@ from app.services.log_erros import GravadorDeErros
 
 def _registro(n: int) -> RegistroErro:
     return RegistroErro(
-        f"req-{n}", "POST", "/api/v1/triagem", 422, "entrada_invalida", "Dados inválidos.", None, 3, "dev"
+        2026, n, f"req-{n}", "POST", "/api/v1/triagem", 422, "entrada_invalida", "Dados inválidos.", None, 3, "dev"
     )
 
 
