@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -18,7 +20,17 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import ErroDeDominio
 from app.core.limiter import limiter
 from app.core.logging import configurar_logs
-from app.repositorios.base import RepositorioListas
+from app.core.profundidade_json import corpo_json_ilegivel
+from app.repositorios.base import RegistroErro, RegistroResposta, RepositorioListas
+from app.services.log_erros import GravadorDeErros
+from app.services.movimentacao import (
+    PRAZO_PARA_NUMERAR_SEGUNDOS,
+    GravadorDeRespostas,
+    conteudo_para_gravar,
+    movimentar,
+    numero_formatado,
+    situacoes,
+)
 
 configurar_logs()
 logger = logging.getLogger(__name__)
@@ -41,10 +53,17 @@ async def criar_repositorio(s: Settings) -> RepositorioListas:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.repositorio = await criar_repositorio(settings)
+    app.state.gravador_erros = GravadorDeErros(app.state.repositorio)
+    app.state.gravador_erros.iniciar()
+    app.state.gravador_respostas = GravadorDeRespostas(app.state.repositorio)
+    app.state.gravador_respostas.iniciar()
     logger.info("api iniciada", extra={"banco": settings.motor_banco, "ambiente": settings.app_env})
     try:
         yield
     finally:
+        # Grava o que ainda estiver nas filas antes de fechar o pool.
+        await app.state.gravador_respostas.parar()
+        await app.state.gravador_erros.parar()
         await app.state.repositorio.fechar()
 
 
@@ -81,11 +100,13 @@ def _resposta_erro(
     codigo: str,
     mensagem: str,
     headers: dict[str, str] | None = None,
+    tipo_excecao: str | None = None,
 ) -> JSONResponse:
     """Formato único de erro: RFC 9457 (Problem Details), o mesmo do Motor .NET.
 
     Corpo sempre com exatamente `title`, `status`, `code` e `request_id` (sem `type`: ausente = about:blank).
     """
+    _registrar_erro(request, status_code, codigo, mensagem, tipo_excecao)
     return JSONResponse(
         status_code=status_code,
         content={
@@ -99,15 +120,118 @@ def _resposta_erro(
     )
 
 
+def _registrar_erro(request: Request, status: int, codigo: str, titulo: str, tipo_excecao: str | None) -> None:
+    """Põe o erro na fila da tabela log_erros (sem esperar o banco). Só metadados: nunca o corpo da requisição.
+
+    Sem número de requisição (rota sem movimentação ou banco fora na chegada), o erro não vai para a tabela:
+    a log_erros nunca tem linha sem (ano, requisicao).
+    """
+    gravador: GravadorDeErros | None = getattr(request.app.state, "gravador_erros", None)
+    numero: tuple[int, int] | None = getattr(request.state, "movimentacao", None)
+    if gravador is None or numero is None:
+        return
+    inicio: float | None = getattr(request.state, "inicio", None)
+    gravador.registrar(
+        RegistroErro(
+            ano=numero[0],
+            requisicao=numero[1],
+            request_id=str(getattr(request.state, "request_id", "") or "-"),
+            metodo=request.method[:10],
+            rota=request.url.path[:200],
+            status=status,
+            codigo=codigo[:40],
+            titulo=titulo[:200],
+            tipo_excecao=tipo_excecao[:200] if tipo_excecao else None,
+            duracao_ms=round((time.perf_counter() - inicio) * 1000) if inicio is not None else None,
+            ambiente=settings.app_env[:20],
+        )
+    )
+
+
+async def _numerar_requisicao(request: Request, conteudo: str | None) -> None:
+    """Grava a chegada na movimentação e guarda (ano, requisicao) em request.state.movimentacao.
+
+    Espera o banco no máximo PRAZO_PARA_NUMERAR_SEGUNDOS: sem número, a requisição segue sem movimentação.
+    """
+    repo: RepositorioListas | None = getattr(request.app.state, "repositorio", None)
+    if repo is None:
+        return
+    try:
+        async with asyncio.timeout(PRAZO_PARA_NUMERAR_SEGUNDOS):
+            request.state.movimentacao = await repo.registrar_requisicao(
+                request.method[:10], request.url.path[:200], conteudo
+            )
+    except Exception as exc:  # noqa: BLE001 - sem número a API continua respondendo
+        logger.warning("requisição sem número na movimentação", extra={"erro": type(exc).__name__})
+
+
+async def _completar_movimentacao(request: Request, response: Response) -> Response:
+    """Põe a resposta na fila da movimentação (sem esperar o banco) e devolve o número no header X-Requisicao."""
+    numero: tuple[int, int] | None = getattr(request.state, "movimentacao", None)
+    if numero is None:
+        return response
+    iterador = getattr(response, "body_iterator", None)
+    if iterador is None:
+        corpo = bytes(response.body)
+    else:  # resposta da rota (streaming): lê o corpo (pequeno) e devolve uma cópia com o mesmo conteúdo
+        corpo = b"".join([parte if isinstance(parte, bytes) else parte.encode() async for parte in iterador])
+        response = Response(content=corpo, status_code=response.status_code, headers=dict(response.headers))
+    gravador: GravadorDeRespostas | None = getattr(request.app.state, "gravador_respostas", None)
+    if gravador is not None:
+        situacao_requisicao, situacao_resposta = situacoes(response.status_code)
+        gravador.registrar(
+            RegistroResposta(
+                ano=numero[0],
+                requisicao=numero[1],
+                status_http=response.status_code,
+                conteudo=conteudo_para_gravar(corpo),
+                situacao_requisicao=situacao_requisicao,
+                situacao_resposta=situacao_resposta,
+            )
+        )
+    response.headers["X-Requisicao"] = numero_formatado(*numero)
+    return response
+
+
 @app.middleware("http")
 async def contexto_da_requisicao(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     request.state.request_id = str(uuid.uuid4())
+    request.state.inicio = time.perf_counter()
 
     tamanho = request.headers.get("content-length")
-    if tamanho is not None and tamanho.isdigit() and int(tamanho) > TAMANHO_MAXIMO_CORPO:
-        return _resposta_erro(request, 413, "corpo_muito_grande", "Corpo da requisição excede o limite.")
+    grande = tamanho is not None and tamanho.isdigit() and int(tamanho) > TAMANHO_MAXIMO_CORPO
+    # Só quem tem chave de API válida entra na movimentação (e tem o corpo lido aqui): varreduras e chamadas sem
+    # chave recebem 401 e não gravam nada no banco.
+    chave_ok = chave_valida(request.headers.get("X-API-Key"), get_settings())
+    corpo = b"" if grande or not chave_ok else await request.body()  # fica em cache para a rota
 
-    response = await call_next(request)
+    # Movimentação: numera e grava a chegada antes de tudo (inclusive dos erros 4xx), menos /health e /metrics.
+    movimenta = chave_ok and movimentar(request.url.path)
+    if movimenta:
+        conteudo = (
+            f"(corpo de {tamanho} bytes, acima do limite: não gravado)" if grande else conteudo_para_gravar(corpo)
+        )
+        await _numerar_requisicao(request, conteudo)
+
+    if grande:
+        response: Response = _resposta_erro(request, 413, "corpo_muito_grande", "Corpo da requisição excede o limite.")
+    elif (
+        # JSON que o Motor .NET recusa na leitura (mais de 64 níveis, NaN/Infinity): 400, igual a ele. Só com
+        # chave válida (sem ela a resposta é 401).
+        chave_ok
+        and request.method == "POST"
+        and "json" in request.headers.get("content-type", "")
+        and corpo_json_ilegivel(corpo)
+    ):
+        response = _resposta_erro(request, 400, "requisicao_invalida", "Requisição inválida.")
+    else:
+        try:
+            response = await call_next(request)
+        except Exception as exc:  # noqa: BLE001 - erro não tratado: o 500 sai daqui para entrar na movimentação
+            response = await tratar_erro_inesperado(request, exc)
+
+    if movimenta:
+        response = await _completar_movimentacao(request, response)
     response.headers["X-Request-ID"] = request.state.request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -146,6 +270,10 @@ async def tratar_erro_http(request: Request, exc: StarletteHTTPException) -> JSO
     # Rota inexistente ou método errado SEM chave válida: 401, como no Motor .NET (não revela quais rotas existem).
     if exc.status_code in (404, 405) and not chave_valida(request.headers.get("X-API-Key"), get_settings()):
         return _resposta_erro(request, 401, "http_401", _TITULOS_HTTP[401], headers={"WWW-Authenticate": "APIKey"})
+    # Corpo que o FastAPI não consegue ler (ex.: UTF-8 inválido): mesmo erro do JSON malformado, como no Motor .NET,
+    # em vez de 400 http_400 com o texto do framework em inglês ("There was an error parsing the body").
+    if exc.status_code == 400:
+        return _resposta_erro(request, 400, "requisicao_invalida", "Requisição inválida.")
     return _resposta_erro(
         request,
         exc.status_code,
@@ -158,7 +286,13 @@ async def tratar_erro_http(request: Request, exc: StarletteHTTPException) -> JSO
 @app.exception_handler(Exception)
 async def tratar_erro_inesperado(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("erro não tratado", extra={"request_id": getattr(request.state, "request_id", None)})
-    return _resposta_erro(request, 500, "erro_interno", "Erro interno. Informe o request_id ao suporte.")
+    return _resposta_erro(
+        request,
+        500,
+        "erro_interno",
+        "Erro interno. Informe o request_id ao suporte.",
+        tipo_excecao=f"{type(exc).__module__}.{type(exc).__qualname__}",
+    )
 
 
 @app.get("/health/live", include_in_schema=False)

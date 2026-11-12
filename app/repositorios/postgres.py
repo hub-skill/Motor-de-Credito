@@ -9,7 +9,17 @@ from datetime import datetime
 from psycopg_pool import AsyncConnectionPool
 
 from app.core.config import Settings
-from app.repositorios.base import SQL_ORIGEM, SQL_PEPS, SQL_SANCOES, OrigemDados, RegistroPep, Sancao
+from app.repositorios.base import (
+    SQL_LOG_ERROS,
+    SQL_ORIGEM,
+    SQL_PEPS,
+    SQL_SANCOES,
+    OrigemDados,
+    RegistroErro,
+    RegistroPep,
+    RegistroResposta,
+    Sancao,
+)
 from app.repositorios.erros_postgres import traduzir_erros_postgres
 
 
@@ -65,5 +75,60 @@ class RepositorioPostgres:
     async def verificar(self) -> None:
         await self._consultar("select 1", ())
 
+    async def gravar_erros(self, registros: list[RegistroErro]) -> None:
+        sql = SQL_LOG_ERROS.format(tabela="credito.log_erros", params=", ".join(["%s"] * 11))
+        with traduzir_erros_postgres():
+            async with self._pool.connection() as conn, conn.transaction():
+                # A sessão é somente leitura (default_transaction_read_only); só esta transação, com SQL fixo,
+                # escreve. A permissão do motor_app nesta tabela é apenas INSERT.
+                await conn.execute("set transaction read write")
+                async with conn.cursor() as cur:
+                    await cur.executemany(sql, [_linha(r) for r in registros])
+
+    async def registrar_requisicao(self, metodo: str, rota: str, conteudo: str | None) -> tuple[int, int]:
+        # A função (SECURITY DEFINER) numera e grava num único comando; o motor_app só tem EXECUTE nela.
+        with traduzir_erros_postgres():
+            async with self._pool.connection() as conn, conn.transaction():
+                await conn.execute("set transaction read write")  # a sessão é somente leitura
+                cur = await conn.execute(
+                    "select ano, requisicao from credito.registrar_requisicao(%s::varchar, %s::varchar, %s::text)",
+                    (metodo, rota, conteudo),
+                )
+                linha = await cur.fetchone()
+        if linha is None:  # pragma: no cover - a função sempre devolve uma linha
+            raise RuntimeError("registrar_requisicao não devolveu o número")
+        return int(linha[0]), int(linha[1])
+
+    async def registrar_respostas(self, registros: list[RegistroResposta]) -> None:
+        sql = (
+            "select credito.registrar_resposta(%s::smallint, %s::bigint, %s::smallint, %s::text,"
+            " %s::char(2), %s::char(2))"
+        )
+        linhas = [
+            (r.ano, r.requisicao, r.status_http, r.conteudo, r.situacao_requisicao, r.situacao_resposta)
+            for r in registros
+        ]
+        with traduzir_erros_postgres():
+            async with self._pool.connection() as conn, conn.transaction():
+                await conn.execute("set transaction read write")
+                async with conn.cursor() as cur:
+                    await cur.executemany(sql, linhas)
+
     async def fechar(self) -> None:
         await self._pool.close()
+
+
+def _linha(r: RegistroErro) -> tuple[object, ...]:
+    return (
+        r.ano,
+        r.requisicao,
+        r.request_id,
+        r.metodo,
+        r.rota,
+        r.status,
+        r.codigo,
+        r.titulo,
+        r.tipo_excecao,
+        r.duracao_ms,
+        r.ambiente,
+    )
