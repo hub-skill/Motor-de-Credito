@@ -56,6 +56,67 @@ async def test_json_invalido_responde_400_e_nao_500(cliente: AsyncClient) -> Non
     afirmar_problema(resposta, 400, "requisicao_invalida")
 
 
+CABECALHOS_JSON = {**CABECALHOS, "Content-Type": "application/json"}
+
+
+def _aninhado(niveis: int) -> bytes:
+    """Corpo válido com um campo extra aninhado até ``niveis`` no total (o objeto da raiz conta como 1)."""
+    return f'{{"documento": "{CPF_VALIDO}", "extra": '.encode() + b"[" * (niveis - 1) + b"]" * (niveis - 1) + b"}"
+
+
+async def test_json_ate_64_niveis_passa_e_acima_responde_400(cliente: AsyncClient) -> None:
+    # Mesmo limite do Motor .NET (MaxDepth 64 do System.Text.Json). Chaves dentro de textos não contam.
+    assert (await cliente.post(URL, content=_aninhado(64), headers=CABECALHOS_JSON)).status_code == 200
+    texto_com_chaves = f'{{"documento": "{CPF_VALIDO}", "nome": "{"[" * 100}"}}'.encode()
+    assert (await cliente.post(URL, content=texto_com_chaves, headers=CABECALHOS_JSON)).status_code == 200
+    afirmar_problema(
+        await cliente.post(URL, content=_aninhado(65), headers=CABECALHOS_JSON), 400, "requisicao_invalida"
+    )
+
+
+@pytest.mark.parametrize("valor", [b"NaN", b"Infinity", b"-Infinity"])
+async def test_nan_e_infinity_respondem_400_como_json_malformado(cliente: AsyncClient, valor: bytes) -> None:
+    # Não existem em JSON (RFC 8259); o json do Python aceitaria, o .NET recusa na leitura. Igualado em 400.
+    corpo = b'{"documento": "' + CPF_VALIDO.encode() + b'", "nome": ' + valor + b"}"
+    afirmar_problema(await cliente.post(URL, content=corpo, headers=CABECALHOS_JSON), 400, "requisicao_invalida")
+
+
+async def test_utf8_invalido_responde_400_e_nao_http_400_em_ingles(cliente: AsyncClient) -> None:
+    corpo = b'{"documento": "' + CPF_VALIDO.encode() + b'", "nome": "Jos' + bytes([0xFF]) + b'"}'  # 0xFF: nunca é UTF-8
+    afirmar_problema(await cliente.post(URL, content=corpo, headers=CABECALHOS_JSON), 400, "requisicao_invalida")
+
+
+async def test_json_fundo_sem_chave_responde_401(cliente: AsyncClient) -> None:
+    resposta = await cliente.post(URL, content=_aninhado(65), headers={"Content-Type": "application/json"})
+    afirmar_problema(resposta, 401, "http_401")
+
+
+@pytest.mark.parametrize(
+    "corpo",
+    [
+        b'{"documento": 52998224725}',
+        b'{"documento": ["529.982.247-25"]}',
+        b'{"documento": "529.982.247-25", "nome": {"a": 1}}',
+        b'[{"documento": "529.982.247-25"}]',
+        b'"529.982.247-25"',
+        b"null",
+        b"",
+    ],
+    ids=[
+        "documento_numero",
+        "documento_lista",
+        "nome_objeto",
+        "lista_no_topo",
+        "texto_no_topo",
+        "null_no_topo",
+        "vazio",
+    ],
+)
+async def test_json_valido_com_forma_errada_responde_422(cliente: AsyncClient, corpo: bytes) -> None:
+    # Igual ao Motor .NET: só o corpo ilegível é 400; JSON válido com forma errada é 422.
+    afirmar_problema(await cliente.post(URL, content=corpo, headers=CABECALHOS_JSON), 422, "entrada_invalida")
+
+
 async def test_cabecalhos_de_seguranca(cliente: AsyncClient) -> None:
     resposta = await cliente.get("/health/live")
     assert resposta.headers["x-content-type-options"] == "nosniff"
