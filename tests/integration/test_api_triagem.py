@@ -6,6 +6,7 @@ from httpx import AsyncClient
 
 from app.repositorios.base import RegistroPep, Sancao
 from tests.conftest import CNPJ_VALIDO, CPF_VALIDO
+from tests.contrato import afirmar_problema
 from tests.integration.conftest import RepositorioFalso
 
 URL = "/api/v1/triagem"
@@ -52,7 +53,7 @@ async def test_cpf_sem_nome_nao_consulta_pep(cliente: AsyncClient, repo: Reposit
 @pytest.mark.parametrize("cabecalhos", [{}, {"X-API-Key": "errada"}])
 async def test_sem_chave_ou_chave_errada(cliente: AsyncClient, cabecalhos: dict[str, str]) -> None:
     r = await cliente.post(URL, json={"documento": CPF_VALIDO}, headers=cabecalhos)
-    assert r.status_code == 401 and r.json()["error"]["code"] == "http_401"
+    afirmar_problema(r, 401, "http_401")
 
 
 @pytest.mark.parametrize(
@@ -69,9 +70,7 @@ async def test_sem_chave_ou_chave_errada(cliente: AsyncClient, cabecalhos: dict[
 )
 async def test_entradas_invalidas(cliente: AsyncClient, corpo: dict[str, str]) -> None:
     r = await cliente.post(URL, json=corpo, headers=CABECALHOS)
-    assert r.status_code == 422
-    erro = r.json()["error"]
-    assert erro["code"] == "entrada_invalida" and erro["request_id"]
+    afirmar_problema(r, 422, "entrada_invalida")
     assert "52998224724" not in r.text  # não ecoa a entrada
 
 
@@ -81,13 +80,13 @@ async def test_corpo_grande_demais(cliente: AsyncClient) -> None:
         content=b'{"documento": "' + b"1" * 5000 + b'"}',
         headers={**CABECALHOS, "Content-Type": "application/json"},
     )
-    assert r.status_code == 413
+    afirmar_problema(r, 413, "corpo_muito_grande")
 
 
 async def test_banco_fora_do_ar(cliente: AsyncClient, repo: RepositorioFalso) -> None:
     repo.falhar = True
     r = await cliente.post(URL, json={"documento": CPF_VALIDO}, headers=CABECALHOS)
-    assert r.status_code == 503 and r.json()["error"]["code"] == "banco_indisponivel"
+    afirmar_problema(r, 503, "banco_indisponivel")
     pronto = await cliente.get("/health/ready")
     assert pronto.status_code == 503
 
@@ -95,7 +94,7 @@ async def test_banco_fora_do_ar(cliente: AsyncClient, repo: RepositorioFalso) ->
 async def test_timeout(cliente: AsyncClient, repo: RepositorioFalso) -> None:
     repo.atraso = 3  # REQUEST_TIMEOUT_SECONDS=2 no conftest
     r = await cliente.post(URL, json={"documento": CPF_VALIDO}, headers=CABECALHOS)
-    assert r.status_code == 504 and r.json()["error"]["code"] == "timeout"
+    afirmar_problema(r, 504, "timeout")
 
 
 async def test_health(cliente: AsyncClient) -> None:

@@ -21,6 +21,7 @@ from app.repositorios.erros_oracle import oracle_codigo_do_erro, oracle_indispon
 from app.repositorios.erros_postgres import pg_erro_de_conexao, traduzir_erros_postgres
 from app.repositorios.oracle import RepositorioOracle
 from app.repositorios.postgres import RepositorioPostgres
+from tests.contrato import afirmar_problema
 
 PORTA_SEM_SERVIDOR = 1
 
@@ -168,5 +169,4 @@ async def test_triagem_com_banco_fora_responde_503(banco: str, monkeypatch: pyte
             resposta = await cliente.post(
                 "/api/v1/triagem", json={"documento": "00000000000191"}, headers={"X-API-Key": os.environ["API_KEY"]}
             )
-    assert resposta.status_code == 503
-    assert resposta.json()["error"]["code"] == "banco_indisponivel"
+    afirmar_problema(resposta, 503, "banco_indisponivel")

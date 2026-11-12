@@ -12,6 +12,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api.deps import chave_valida
 from app.api.v1.routes import router as router_v1
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ErroDeDominio
@@ -66,6 +67,14 @@ app.add_middleware(
 )
 
 
+# Textos dos erros genéricos do framework (401, 404, 405), em português e iguais aos do Motor .NET.
+_TITULOS_HTTP = {
+    401: "Chave de API ausente ou inválida.",
+    404: "Recurso não encontrado.",
+    405: "Método não permitido.",
+}
+
+
 def _resposta_erro(
     request: Request,
     status_code: int,
@@ -73,16 +82,20 @@ def _resposta_erro(
     mensagem: str,
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:
+    """Formato único de erro: RFC 9457 (Problem Details), o mesmo do Motor .NET.
+
+    Corpo sempre com exatamente `title`, `status`, `code` e `request_id` (sem `type`: ausente = about:blank).
+    """
     return JSONResponse(
         status_code=status_code,
         content={
-            "error": {
-                "code": codigo,
-                "message": mensagem,
-                "request_id": getattr(request.state, "request_id", None),
-            }
+            "title": mensagem,
+            "status": status_code,
+            "code": codigo,
+            "request_id": getattr(request.state, "request_id", None),
         },
         headers=headers,
+        media_type="application/problem+json",
     )
 
 
@@ -130,11 +143,14 @@ async def tratar_rate_limit(request: Request, exc: RateLimitExceeded) -> JSONRes
 
 @app.exception_handler(StarletteHTTPException)
 async def tratar_erro_http(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    # Rota inexistente ou método errado SEM chave válida: 401, como no Motor .NET (não revela quais rotas existem).
+    if exc.status_code in (404, 405) and not chave_valida(request.headers.get("X-API-Key"), get_settings()):
+        return _resposta_erro(request, 401, "http_401", _TITULOS_HTTP[401], headers={"WWW-Authenticate": "APIKey"})
     return _resposta_erro(
         request,
         exc.status_code,
         f"http_{exc.status_code}",
-        str(exc.detail),
+        _TITULOS_HTTP.get(exc.status_code, str(exc.detail)),
         headers=dict(exc.headers) if exc.headers else None,
     )
 
@@ -142,7 +158,7 @@ async def tratar_erro_http(request: Request, exc: StarletteHTTPException) -> JSO
 @app.exception_handler(Exception)
 async def tratar_erro_inesperado(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("erro não tratado", extra={"request_id": getattr(request.state, "request_id", None)})
-    return _resposta_erro(request, 500, "erro_interno", "Erro interno. Informe o request_id.")
+    return _resposta_erro(request, 500, "erro_interno", "Erro interno. Informe o request_id ao suporte.")
 
 
 @app.get("/health/live", include_in_schema=False)
