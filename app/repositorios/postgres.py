@@ -9,7 +9,16 @@ from datetime import datetime
 from psycopg_pool import AsyncConnectionPool
 
 from app.core.config import Settings
-from app.repositorios.base import SQL_ORIGEM, SQL_PEPS, SQL_SANCOES, OrigemDados, RegistroPep, Sancao
+from app.repositorios.base import (
+    SQL_LOG_ERROS,
+    SQL_ORIGEM,
+    SQL_PEPS,
+    SQL_SANCOES,
+    OrigemDados,
+    RegistroErro,
+    RegistroPep,
+    Sancao,
+)
 from app.repositorios.erros_postgres import traduzir_erros_postgres
 
 
@@ -65,5 +74,19 @@ class RepositorioPostgres:
     async def verificar(self) -> None:
         await self._consultar("select 1", ())
 
+    async def gravar_erros(self, registros: list[RegistroErro]) -> None:
+        sql = SQL_LOG_ERROS.format(tabela="credito.log_erros", params=", ".join(["%s"] * 9))
+        with traduzir_erros_postgres():
+            async with self._pool.connection() as conn, conn.transaction():
+                # A sessão é somente leitura (default_transaction_read_only); só esta transação, com SQL fixo,
+                # escreve. A permissão do motor_app nesta tabela é apenas INSERT.
+                await conn.execute("set transaction read write")
+                async with conn.cursor() as cur:
+                    await cur.executemany(sql, [_linha(r) for r in registros])
+
     async def fechar(self) -> None:
         await self._pool.close()
+
+
+def _linha(r: RegistroErro) -> tuple[object, ...]:
+    return (r.request_id, r.metodo, r.rota, r.status, r.codigo, r.titulo, r.tipo_excecao, r.duracao_ms, r.ambiente)

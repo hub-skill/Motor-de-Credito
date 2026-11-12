@@ -34,6 +34,21 @@ class OrigemDados:
     carregado_em: datetime | None
 
 
+@dataclass(frozen=True)
+class RegistroErro:
+    """Uma resposta de erro da API, para a tabela log_erros. Só metadados: nunca documento, nome ou corpo."""
+
+    request_id: str
+    metodo: str
+    rota: str
+    status: int
+    codigo: str
+    titulo: str
+    tipo_excecao: str | None
+    duracao_ms: int | None
+    ambiente: str
+
+
 class RepositorioListas(Protocol):
     async def buscar_sancoes(self, documento: str) -> list[Sancao]: ...
 
@@ -43,6 +58,10 @@ class RepositorioListas(Protocol):
 
     async def verificar(self) -> None:
         """Lança exceção se o banco não responder (usado pelo /health/ready)."""
+        ...
+
+    async def gravar_erros(self, registros: list[RegistroErro]) -> None:
+        """Grava um lote na tabela log_erros (a aplicação só tem INSERT nela)."""
         ...
 
     async def fechar(self) -> None: ...
@@ -58,5 +77,9 @@ SQL_PEPS = (
     "select nome, descricao_funcao, nome_orgao, data_inicio_exercicio,"
     " data_fim_exercicio, data_fim_carencia"
     " from {tabela} where cpf_miolo = {param}"
+)
+SQL_LOG_ERROS = (
+    "insert into {tabela} (request_id, metodo, rota, status, codigo, titulo, tipo_excecao, duracao_ms, ambiente)"
+    " values ({params})"
 )
 SQL_ORIGEM = "select arquivo_origem, max(carregado_em) from {tabela} group by arquivo_origem"

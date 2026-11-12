@@ -1,6 +1,6 @@
 """Testes contra os bancos reais (dados da carga da CGU). Rode com: pytest -m bancos --no-cov
 
-Leem as credenciais do .env da pasta do projeto. Só leitura.
+Leem as credenciais do .env da pasta do projeto. Só leitura, exceto o log de erros (só insert).
 """
 
 import os
@@ -12,7 +12,7 @@ import pytest_asyncio
 from dotenv import dotenv_values
 
 from app.core.config import Settings
-from app.repositorios.base import RepositorioListas
+from app.repositorios.base import RegistroErro, RepositorioListas
 from app.repositorios.oracle import RepositorioOracle
 from app.repositorios.postgres import RepositorioPostgres
 
@@ -63,3 +63,39 @@ async def test_peps_por_miolo_e_origem(repo: RepositorioListas) -> None:
     # O miolo "000000" deve ter poucos ou nenhum registro; só checa o formato do retorno.
     for p in await repo.buscar_peps_por_miolo("000000"):
         assert p.nome
+
+
+async def test_grava_log_de_erros_mas_nao_le(repo: RepositorioListas) -> None:
+    # A aplicação só tem INSERT em log_erros: gravar funciona, ler é negado (sessão de leitura comum).
+    await repo.gravar_erros(
+        [
+            RegistroErro(
+                "teste-bancos-1",
+                "POST",
+                "/api/v1/triagem",
+                422,
+                "entrada_invalida",
+                "Dados inválidos.",
+                None,
+                5,
+                "teste",
+            ),
+            RegistroErro(
+                "teste-bancos-2",
+                "GET",
+                "/x",
+                500,
+                "erro_interno",
+                "Erro interno.",
+                "builtins.RuntimeError",
+                None,
+                "teste",
+            ),
+        ]
+    )
+    postgres = isinstance(repo, RepositorioPostgres)
+    with pytest.raises(Exception):  # noqa: B017, PT011 - permissão negada, cada driver com sua exceção
+        await repo._consultar(  # type: ignore[attr-defined]
+            "select count(*) from credito.log_erros" if postgres else "select count(*) from log_erros",
+            () if postgres else {},
+        )

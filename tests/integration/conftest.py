@@ -11,7 +11,7 @@ from httpx import ASGITransport, AsyncClient
 from app.api.deps import CacheOrigem, get_cache_origem, get_repositorio
 from app.core.exceptions import BancoIndisponivel
 from app.main import app
-from app.repositorios.base import OrigemDados, RegistroPep, Sancao
+from app.repositorios.base import OrigemDados, RegistroErro, RegistroPep, Sancao
 
 
 class RepositorioFalso:
@@ -42,8 +42,21 @@ class RepositorioFalso:
         if self.falhar:
             raise BancoIndisponivel()
 
+    async def gravar_erros(self, registros: list[RegistroErro]) -> None:
+        return None
+
     async def fechar(self) -> None:
         return None
+
+
+class GravadorFalso:
+    """Guarda os erros registrados pela API (no lugar da fila que grava na tabela log_erros)."""
+
+    def __init__(self) -> None:
+        self.registros: list[RegistroErro] = []
+
+    def registrar(self, registro: RegistroErro) -> None:
+        self.registros.append(registro)
 
 
 @pytest.fixture
@@ -51,11 +64,18 @@ def repo() -> RepositorioFalso:
     return RepositorioFalso()
 
 
+@pytest.fixture
+def gravador() -> GravadorFalso:
+    return GravadorFalso()
+
+
 @pytest_asyncio.fixture
-async def cliente(repo: RepositorioFalso) -> AsyncIterator[AsyncClient]:
+async def cliente(repo: RepositorioFalso, gravador: GravadorFalso) -> AsyncIterator[AsyncClient]:
     app.dependency_overrides[get_repositorio] = lambda: repo
     app.dependency_overrides[get_cache_origem] = lambda: CacheOrigem(ttl=0)
     app.state.repositorio = repo
+    app.state.gravador_erros = gravador
     async with AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test") as c:
         yield c
     app.dependency_overrides.clear()
+    del app.state.gravador_erros

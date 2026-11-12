@@ -17,6 +17,7 @@ from psycopg_pool import PoolTimeout
 import app.main as modulo_main
 from app.core.config import Settings, get_settings
 from app.core.exceptions import BancoExpirou, BancoIndisponivel
+from app.repositorios.base import RegistroErro
 from app.repositorios.erros_oracle import oracle_codigo_do_erro, oracle_indisponivel, traduzir_erros_oracle
 from app.repositorios.erros_postgres import pg_erro_de_conexao, traduzir_erros_postgres
 from app.repositorios.oracle import RepositorioOracle
@@ -53,6 +54,19 @@ async def test_repositorio_oracle_fora_do_ar_vira_banco_indisponivel() -> None:
             await repo.verificar()
     finally:
         await repo.fechar()
+
+
+_REGISTRO = RegistroErro("r1", "POST", "/api/v1/triagem", 503, "banco_indisponivel", "Banco fora.", None, 1, "dev")
+
+
+async def test_log_de_erros_com_banco_fora_vira_banco_indisponivel() -> None:
+    # O GravadorDeErros captura a exceção; aqui só se confere que o driver não vaza o erro cru.
+    for repo in (await RepositorioPostgres.criar(_settings()), await RepositorioOracle.criar(_settings())):
+        try:
+            with pytest.raises(BancoIndisponivel):
+                await repo.gravar_erros([_REGISTRO])
+        finally:
+            await repo.fechar()
 
 
 # --- PostgreSQL: exceções do driver ---

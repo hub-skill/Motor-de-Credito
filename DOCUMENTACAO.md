@@ -288,6 +288,29 @@ As mensagens de erro nunca repetem a entrada (CPF, nome) nem detalhes internos. 
 espera crescente; nunca repita erros de entrada (400, 413, 422). **Na dúvida (503/504), não aprove a venda sem
 triagem**: trate como pendente.
 
+### Log de erros no banco
+
+Toda resposta de erro (4xx e 5xx) é gravada na tabela `log_erros`, no mesmo banco que a API estiver usando:
+
+| Banco | Tabela |
+|---|---|
+| PostgreSQL | `credito.log_erros` |
+| Oracle | `motor_credito.log_erros` |
+
+Colunas: `ocorrido_em`, `request_id` (o mesmo devolvido ao cliente), `metodo`, `rota`, `status`, `codigo`, `titulo`,
+`tipo_excecao` (só no 500), `duracao_ms` e `ambiente` (`APP_ENV`). **Nunca** grava CPF, CNPJ, nome ou o corpo da
+requisição. As tabelas são criadas por `banco/criar_tabelas.py` (script `03_log_erros.sql`).
+
+- A resposta não espera o banco: o erro entra numa fila em memória (até 1000) e é gravado em lotes de até 100.
+  Com o banco fora ou lento, a fila enche e os registros a mais são descartados (aviso no log da aplicação);
+  a API continua respondendo normalmente. Ao desligar, a API grava o que ainda estiver na fila (até 5 s).
+- O usuário da aplicação (`motor_app / MOTOR_APP`) só tem **INSERT** nessa tabela: não lê, não altera e não apaga. Consultas e
+  limpeza são feitas por um administrador.
+- Para achar o erro que um cliente relatou: `select * from credito.log_erros where request_id = '<request_id>'`.
+- Limpeza (o volume cresce com varreduras e clientes integrando errado). Exemplo, manter 90 dias:
+  `delete from credito.log_erros where ocorrido_em < now() - interval '90 days'` (PostgreSQL) ou
+  `DELETE FROM motor_credito.log_erros WHERE ocorrido_em < SYSTIMESTAMP - INTERVAL '90' DAY` (Oracle).
+
 ---
 
 ## 7. Exemplos de integração
@@ -428,6 +451,8 @@ reinícios.
 
 - `/health/ready` no balanceador/orquestrador (tira a instância de rotação se o banco cair).
 - `/metrics` no Prometheus: acompanhe taxa de 503/504 e latência.
+- Tabela `log_erros` (seção 6): histórico dos erros por `request_id`, rota e código. Avisos `fila do log de erros
+  cheia` ou `falha ao gravar o log de erros` no log da aplicação indicam que o banco não está recebendo os registros.
 - Logs em JSON com `request_id`; falhas de banco aparecem como `postgres indisponível` ou `erro oracle` com o
   código (`codigo_oracle`), nunca com a senha.
 

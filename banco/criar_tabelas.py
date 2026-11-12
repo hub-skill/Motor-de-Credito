@@ -4,8 +4,8 @@ Uso (na pasta "Motor de credito"):
     uv run --no-project --with "psycopg[binary]" --with oracledb --with python-dotenv \
         python banco/criar_tabelas.py [postgres|oracle|todos]
 
-- PostgreSQL: executa banco/postgres/02_tabelas_cgu.sql como PG_ADMIN_USER no PG_DATABASE.
-- Oracle: executa banco/oracle/01_usuarios.sql e 02_tabelas_cgu.sql como ORACLE_ADMIN_USER.
+- PostgreSQL: executa banco/postgres/02_tabelas_cgu.sql e 03_log_erros.sql como PG_ADMIN_USER no PG_DATABASE.
+- Oracle: executa banco/oracle/01_usuarios.sql, 02_tabelas_cgu.sql e 03_log_erros.sql como ORACLE_ADMIN_USER.
 - Depois confere o acesso com os usuários da aplicação (PG_USER e ORACLE_USER).
 - Reexecutar é seguro: objetos que já existem são mantidos.
 - Nunca imprime senhas nem o objeto de erro de conexão (que pode conter a senha).
@@ -42,9 +42,10 @@ def postgres() -> None:
     try:
         with psycopg.connect(user=env["PG_ADMIN_USER"], password=env["PG_ADMIN_PASSWORD"],
                              autocommit=True, **comum) as conn:
-            sql = (PASTA / "postgres" / "02_tabelas_cgu.sql").read_text(encoding="utf-8")
-            conn.execute(sql)  # sem parâmetros: o psycopg aceita vários comandos de uma vez
-            print("[ok] 02_tabelas_cgu.sql executado como", env["PG_ADMIN_USER"])
+            for arquivo in ("02_tabelas_cgu.sql", "03_log_erros.sql"):
+                sql = (PASTA / "postgres" / arquivo).read_text(encoding="utf-8")
+                conn.execute(sql)  # sem parâmetros: o psycopg aceita vários comandos de uma vez
+                print(f"[ok] {arquivo} executado como", env["PG_ADMIN_USER"])
     except psycopg.Error as exc:
         print(f"[erro] {type(exc).__name__} sqlstate={exc.sqlstate}")
         raise SystemExit(1) from None
@@ -63,6 +64,16 @@ def postgres() -> None:
             ).fetchone()[0]
             print(f"[ok] {env['PG_USER']} acessa {tabela} sem prefixo: {cols} colunas, {linha[0]} linhas,"
                   f" select={linha[1]} insert={linha[2]} delete={linha[3]}")
+        # Log de erros: a aplicação só insere (sem select, update ou delete).
+        pode = conn.execute(
+            "select has_table_privilege('credito.log_erros', 'INSERT'),"
+            " has_table_privilege('credito.log_erros', 'SELECT'),"
+            " has_table_privilege('credito.log_erros', 'UPDATE'),"
+            " has_table_privilege('credito.log_erros', 'DELETE')"
+        ).fetchone()
+        esperado = (True, False, False, False)
+        print(f"[{'ok' if pode == esperado else 'ERRO'}] {env['PG_USER']} em log_erros:"
+              f" insert={pode[0]} select={pode[1]} update={pode[2]} delete={pode[3]} (esperado: só insert)")
 
 
 # --------------------------------------------------------------------- Oracle
@@ -109,7 +120,7 @@ def oracle() -> None:
     with conn:
         print(f"[ok] conectado como {env['ORACLE_ADMIN_USER']} em {env['ORACLE_DSN']}")
         with conn.cursor() as cur:
-            for arquivo in ("01_usuarios.sql", "02_tabelas_cgu.sql"):
+            for arquivo in ("01_usuarios.sql", "02_tabelas_cgu.sql", "03_log_erros.sql"):
                 criados = ignorados = 0
                 for sql in comandos_oracle(PASTA / "oracle" / arquivo):
                     resumo = re.sub(r'IDENTIFIED BY "[^"]*"', 'IDENTIFIED BY "***"',
@@ -136,6 +147,13 @@ def oracle() -> None:
                             " and table_name = :t", t=tabela.upper())
                 cols = cur.fetchone()[0]
                 print(f"[ok] {env['ORACLE_USER']} acessa {tabela} pelo sinônimo: {cols} colunas, {linhas} linhas")
+            # Log de erros: a aplicação só insere (sem select, update ou delete).
+            cur.execute("select listagg(privilege, ',') within group (order by privilege) from all_tab_privs"
+                        " where table_schema = 'MOTOR_CREDITO' and table_name = 'LOG_ERROS' and grantee = :u",
+                        u=env["ORACLE_USER"].upper())
+            privilegios = cur.fetchone()[0]
+            print(f"[{'ok' if privilegios == 'INSERT' else 'ERRO'}] {env['ORACLE_USER']} em log_erros:"
+                  f" {privilegios} (esperado: só INSERT)")
 
 
 if __name__ == "__main__":

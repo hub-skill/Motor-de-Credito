@@ -1,11 +1,21 @@
 """Repositório Oracle (python-oracledb thin, async + pool). MOTOR_APP lê pelos sinônimos."""
 
+from dataclasses import asdict
 from datetime import datetime
 
 import oracledb
 
 from app.core.config import Settings
-from app.repositorios.base import SQL_ORIGEM, SQL_PEPS, SQL_SANCOES, OrigemDados, RegistroPep, Sancao
+from app.repositorios.base import (
+    SQL_LOG_ERROS,
+    SQL_ORIGEM,
+    SQL_PEPS,
+    SQL_SANCOES,
+    OrigemDados,
+    RegistroErro,
+    RegistroPep,
+    Sancao,
+)
 from app.repositorios.erros_oracle import traduzir_erros_oracle
 
 
@@ -71,6 +81,18 @@ class RepositorioOracle:
 
     async def verificar(self) -> None:
         await self._consultar("select 1 from dual", {})
+
+    async def gravar_erros(self, registros: list[RegistroErro]) -> None:
+        sql = SQL_LOG_ERROS.format(
+            tabela="log_erros",  # sinônimo do MOTOR_APP para MOTOR_CREDITO.LOG_ERROS
+            params=":request_id, :metodo, :rota, :status, :codigo, :titulo, :tipo_excecao, :duracao_ms, :ambiente",
+        )
+        with traduzir_erros_oracle():
+            async with self._pool.acquire() as conn:
+                conn.call_timeout = self._timeout
+                with conn.cursor() as cur:
+                    await cur.executemany(sql, [asdict(r) for r in registros])
+                await conn.commit()
 
     async def fechar(self) -> None:
         await self._pool.close(force=True)

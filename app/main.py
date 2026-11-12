@@ -1,4 +1,5 @@
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -18,7 +19,8 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import ErroDeDominio
 from app.core.limiter import limiter
 from app.core.logging import configurar_logs
-from app.repositorios.base import RepositorioListas
+from app.repositorios.base import RegistroErro, RepositorioListas
+from app.services.log_erros import GravadorDeErros
 
 configurar_logs()
 logger = logging.getLogger(__name__)
@@ -41,10 +43,13 @@ async def criar_repositorio(s: Settings) -> RepositorioListas:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.repositorio = await criar_repositorio(settings)
+    app.state.gravador_erros = GravadorDeErros(app.state.repositorio)
+    app.state.gravador_erros.iniciar()
     logger.info("api iniciada", extra={"banco": settings.motor_banco, "ambiente": settings.app_env})
     try:
         yield
     finally:
+        await app.state.gravador_erros.parar()  # grava o que ainda estiver na fila antes de fechar o pool
         await app.state.repositorio.fechar()
 
 
@@ -81,11 +86,13 @@ def _resposta_erro(
     codigo: str,
     mensagem: str,
     headers: dict[str, str] | None = None,
+    tipo_excecao: str | None = None,
 ) -> JSONResponse:
     """Formato único de erro: RFC 9457 (Problem Details), o mesmo do Motor .NET.
 
     Corpo sempre com exatamente `title`, `status`, `code` e `request_id` (sem `type`: ausente = about:blank).
     """
+    _registrar_erro(request, status_code, codigo, mensagem, tipo_excecao)
     return JSONResponse(
         status_code=status_code,
         content={
@@ -99,9 +106,31 @@ def _resposta_erro(
     )
 
 
+def _registrar_erro(request: Request, status: int, codigo: str, titulo: str, tipo_excecao: str | None) -> None:
+    """Põe o erro na fila da tabela log_erros (sem esperar o banco). Só metadados: nunca o corpo da requisição."""
+    gravador: GravadorDeErros | None = getattr(request.app.state, "gravador_erros", None)
+    if gravador is None:  # testes sem lifespan
+        return
+    inicio: float | None = getattr(request.state, "inicio", None)
+    gravador.registrar(
+        RegistroErro(
+            request_id=str(getattr(request.state, "request_id", "") or "-"),
+            metodo=request.method[:10],
+            rota=request.url.path[:200],
+            status=status,
+            codigo=codigo[:40],
+            titulo=titulo[:200],
+            tipo_excecao=tipo_excecao[:200] if tipo_excecao else None,
+            duracao_ms=round((time.perf_counter() - inicio) * 1000) if inicio is not None else None,
+            ambiente=settings.app_env[:20],
+        )
+    )
+
+
 @app.middleware("http")
 async def contexto_da_requisicao(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     request.state.request_id = str(uuid.uuid4())
+    request.state.inicio = time.perf_counter()
 
     tamanho = request.headers.get("content-length")
     if tamanho is not None and tamanho.isdigit() and int(tamanho) > TAMANHO_MAXIMO_CORPO:
@@ -158,7 +187,13 @@ async def tratar_erro_http(request: Request, exc: StarletteHTTPException) -> JSO
 @app.exception_handler(Exception)
 async def tratar_erro_inesperado(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("erro não tratado", extra={"request_id": getattr(request.state, "request_id", None)})
-    return _resposta_erro(request, 500, "erro_interno", "Erro interno. Informe o request_id ao suporte.")
+    return _resposta_erro(
+        request,
+        500,
+        "erro_interno",
+        "Erro interno. Informe o request_id ao suporte.",
+        tipo_excecao=f"{type(exc).__module__}.{type(exc).__qualname__}",
+    )
 
 
 @app.get("/health/live", include_in_schema=False)
