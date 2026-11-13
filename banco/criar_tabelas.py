@@ -4,9 +4,9 @@ Uso (na pasta "Motor de credito"):
     uv run --no-project --with "psycopg[binary]" --with oracledb --with python-dotenv \
         python banco/criar_tabelas.py [postgres|oracle|todos]
 
-- PostgreSQL: executa banco/postgres/02_tabelas_cgu.sql, 03_movimentacao.sql e 04_log_erros.sql como PG_ADMIN_USER.
-- Oracle: executa banco/oracle/01_usuarios.sql, 02_tabelas_cgu.sql, 03_movimentacao.sql e 04_log_erros.sql
-  como ORACLE_ADMIN_USER e confere se as procedures compilaram.
+- PostgreSQL: executa banco/postgres/02_tabelas_cgu.sql e 03_movimentacao.sql (movimentação e log_erros) como
+  PG_ADMIN_USER.
+- Oracle: executa banco/oracle/01_usuarios.sql, 02_tabelas_cgu.sql e 03_movimentacao.sql como ORACLE_ADMIN_USER.
 - Depois confere o acesso com os usuários da aplicação (PG_USER e ORACLE_USER).
 - Reexecutar é seguro: objetos que já existem são mantidos.
 - Nunca imprime senhas nem o objeto de erro de conexão (que pode conter a senha).
@@ -43,7 +43,7 @@ def postgres() -> None:
     try:
         with psycopg.connect(user=env["PG_ADMIN_USER"], password=env["PG_ADMIN_PASSWORD"],
                              autocommit=True, **comum) as conn:
-            for arquivo in ("02_tabelas_cgu.sql", "03_movimentacao.sql", "04_log_erros.sql"):
+            for arquivo in ("02_tabelas_cgu.sql", "03_movimentacao.sql"):
                 sql = (PASTA / "postgres" / arquivo).read_text(encoding="utf-8")
                 conn.execute(sql)  # sem parâmetros: o psycopg aceita vários comandos de uma vez
                 print(f"[ok] {arquivo} executado como", env["PG_ADMIN_USER"])
@@ -65,31 +65,16 @@ def postgres() -> None:
             ).fetchone()[0]
             print(f"[ok] {env['PG_USER']} acessa {tabela} sem prefixo: {cols} colunas, {linha[0]} linhas,"
                   f" select={linha[1]} insert={linha[2]} delete={linha[3]}")
-        # Log de erros: a aplicação só insere (sem select, update ou delete).
-        pode = conn.execute(
-            "select has_table_privilege('credito.log_erros', 'INSERT'),"
-            " has_table_privilege('credito.log_erros', 'SELECT'),"
-            " has_table_privilege('credito.log_erros', 'UPDATE'),"
-            " has_table_privilege('credito.log_erros', 'DELETE')"
-        ).fetchone()
-        esperado = (True, False, False, False)
-        print(f"[{'ok' if pode == esperado else 'ERRO'}] {env['PG_USER']} em log_erros:"
-              f" insert={pode[0]} select={pode[1]} update={pode[2]} delete={pode[3]} (esperado: só insert)")
-        # Movimentação: nenhum privilégio nas tabelas; só executa as duas funções.
-        mov = conn.execute(
-            "select bool_or(has_table_privilege(t, p))"
-            "  from unnest(array['credito.movimentacao', 'credito.contador_requisicao']) t,"
-            "       unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE']) p"
-        ).fetchone()[0]
-        exec_req, exec_resp = conn.execute(
-            "select has_function_privilege('credito.registrar_requisicao(varchar, varchar, text)', 'EXECUTE'),"
-            " has_function_privilege('credito.registrar_resposta(smallint, bigint, smallint, text, char, char)',"
-            " 'EXECUTE')"
-        ).fetchone()
-        ok = not mov and exec_req and exec_resp
-        print(f"[{'ok' if ok else 'ERRO'}] {env['PG_USER']} na movimentação: acesso direto às tabelas={mov},"
-              f" executa registrar_requisicao={exec_req} e registrar_resposta={exec_resp}"
-              " (esperado: só executa as funções)")
+        # Movimentação e log de erros: a aplicação só insere (sem select, update ou delete).
+        for tabela in ("movimentacao", "log_erros"):
+            pode = conn.execute(
+                "select has_table_privilege(%s, 'INSERT'), has_table_privilege(%s, 'SELECT'),"
+                " has_table_privilege(%s, 'UPDATE'), has_table_privilege(%s, 'DELETE')",
+                (f"credito.{tabela}",) * 4,
+            ).fetchone()
+            esperado = (True, False, False, False)
+            print(f"[{'ok' if pode == esperado else 'ERRO'}] {env['PG_USER']} em {tabela}:"
+                  f" insert={pode[0]} select={pode[1]} update={pode[2]} delete={pode[3]} (esperado: só insert)")
 
 
 # --------------------------------------------------------------------- Oracle
@@ -136,7 +121,7 @@ def oracle() -> None:
     with conn:
         print(f"[ok] conectado como {env['ORACLE_ADMIN_USER']} em {env['ORACLE_DSN']}")
         with conn.cursor() as cur:
-            for arquivo in ("01_usuarios.sql", "02_tabelas_cgu.sql", "03_movimentacao.sql", "04_log_erros.sql"):
+            for arquivo in ("01_usuarios.sql", "02_tabelas_cgu.sql", "03_movimentacao.sql"):
                 criados = ignorados = 0
                 for sql in comandos_oracle(PASTA / "oracle" / arquivo):
                     resumo = re.sub(r'IDENTIFIED BY "[^"]*"', 'IDENTIFIED BY "***"',
@@ -153,17 +138,6 @@ def oracle() -> None:
                             print(f"[erro] {err.full_code} em: {resumo}")
                             raise SystemExit(1) from None
                 print(f"[ok] {arquivo}: {criados} comandos executados, {ignorados} já existiam")
-            # CREATE PROCEDURE com erro de compilação não lança exceção: confere o status.
-            cur.execute("select object_name, status from all_objects where owner = 'MOTOR_CREDITO'"
-                        " and object_type = 'PROCEDURE' order by object_name")
-            for nome, status in cur.fetchall():
-                print(f"[{'ok' if status == 'VALID' else 'ERRO'}] procedure {nome}: {status}")
-                if status != "VALID":
-                    cur.execute("select line, text from all_errors where owner = 'MOTOR_CREDITO' and name = :n",
-                                n=nome)
-                    for linha, texto in cur.fetchall():
-                        print(f"   linha {linha}: {texto.strip()}")
-                    raise SystemExit(1)
 
     with oracledb.connect(user=env["ORACLE_USER"], password=senha_app, dsn=env["ORACLE_DSN"]) as app:
         with app.cursor() as cur:
@@ -174,22 +148,14 @@ def oracle() -> None:
                             " and table_name = :t", t=tabela.upper())
                 cols = cur.fetchone()[0]
                 print(f"[ok] {env['ORACLE_USER']} acessa {tabela} pelo sinônimo: {cols} colunas, {linhas} linhas")
-            # Log de erros: a aplicação só insere (sem select, update ou delete).
-            cur.execute("select listagg(privilege, ',') within group (order by privilege) from all_tab_privs"
-                        " where table_schema = 'MOTOR_CREDITO' and table_name = 'LOG_ERROS' and grantee = :u",
-                        u=env["ORACLE_USER"].upper())
-            privilegios = cur.fetchone()[0]
-            print(f"[{'ok' if privilegios == 'INSERT' else 'ERRO'}] {env['ORACLE_USER']} em log_erros:"
-                  f" {privilegios} (esperado: só INSERT)")
-            # Movimentação: nenhum privilégio nas tabelas; só executa as duas procedures.
-            cur.execute("select table_name || ':' || privilege from all_tab_privs where table_schema = 'MOTOR_CREDITO'"
-                        " and table_name in ('MOVIMENTACAO', 'CONTADOR_REQUISICAO', 'REGISTRAR_REQUISICAO',"
-                        " 'REGISTRAR_RESPOSTA') and grantee = :u order by 1", u=env["ORACLE_USER"].upper())
-            privilegios = [linha[0] for linha in cur.fetchall()]
-            esperado = ["REGISTRAR_REQUISICAO:EXECUTE", "REGISTRAR_RESPOSTA:EXECUTE"]
-            print(f"[{'ok' if privilegios == esperado else 'ERRO'}] {env['ORACLE_USER']} na movimentação:"
-                  f" {', '.join(privilegios)} (esperado: só EXECUTE nas duas procedures)")
-
+            # Movimentação e log de erros: a aplicação só insere (sem select, update ou delete).
+            for tabela in ("movimentacao", "log_erros"):
+                cur.execute("select listagg(privilege, ',') within group (order by privilege) from all_tab_privs"
+                            " where table_schema = 'MOTOR_CREDITO' and table_name = :t and grantee = :u",
+                            t=tabela.upper(), u=env["ORACLE_USER"].upper())
+                privilegios = cur.fetchone()[0]
+                print(f"[{'ok' if privilegios == 'INSERT' else 'ERRO'}] {env['ORACLE_USER']} em {tabela}:"
+                      f" {privilegios} (esperado: só INSERT)")
 
 if __name__ == "__main__":
     alvo = sys.argv[1] if len(sys.argv) > 1 else "todos"

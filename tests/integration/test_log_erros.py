@@ -1,7 +1,7 @@
 """Toda resposta de erro (4xx e 5xx) vai para o log de erros, só com metadados (nunca documento ou nome).
 
-Cada erro leva a chave (ano, requisicao) da sua movimentação; sem ela (rota sem movimentação ou banco fora na
-chegada) o erro não é gravado: a log_erros nunca tem linha sem a chave.
+O erro é gravado junto com a sua movimentação (mesma transação, ligado pelo ULID): sem movimentação (rota sem
+movimentação, ou sem chave de API válida) não há erro gravado.
 """
 
 import os
@@ -9,47 +9,64 @@ import os
 from httpx import AsyncClient
 
 from app.core.config import get_settings
+from app.movimentacao.http import Movimentacao
+from app.movimentacao.registros import RegistroErro
 from tests.conftest import CPF_VALIDO
-from tests.integration.conftest import ANO_FALSO, GravadorFalso, RepositorioFalso
+from tests.integration.conftest import RepositorioFalso, id_do_header
 
 URL = "/api/v1/triagem"
 CABECALHOS = {"X-API-Key": os.environ["API_KEY"]}
 
 
+def _erros(repo: RepositorioFalso) -> list[RegistroErro]:
+    return [r.erro for r in repo.movimentacao.registros if r.erro is not None]
+
+
 async def test_entrada_invalida_registra_metadados_sem_dados_pessoais(
-    cliente: AsyncClient, gravador: GravadorFalso
+    cliente: AsyncClient, repo: RepositorioFalso, movimentacao: Movimentacao
 ) -> None:
     cpf_errado = "529.982.247-24"
     resposta = await cliente.post(URL, json={"documento": cpf_errado, "nome": "Fulano de Tal"}, headers=CABECALHOS)
+    await movimentacao.parar()
 
     assert resposta.status_code == 422
-    (registro,) = gravador.registros
-    assert registro.request_id == resposta.json()["request_id"] == resposta.headers["x-request-id"]
-    assert (registro.metodo, registro.rota, registro.status) == ("POST", URL, 422)
-    assert (registro.codigo, registro.titulo) == ("entrada_invalida", resposta.json()["title"])
-    assert registro.tipo_excecao is None
-    assert registro.duracao_ms is not None and registro.duracao_ms >= 0
-    assert registro.ambiente == get_settings().app_env
-    assert "982" not in repr(registro) and "Fulano" not in repr(registro)
+    (erro,) = _erros(repo)
+    assert erro.request_id == resposta.json()["request_id"] == resposta.headers["x-request-id"]
+    assert (erro.metodo, erro.rota, erro.status) == ("POST", URL, 422)
+    assert (erro.codigo, erro.titulo) == ("entrada_invalida", resposta.json()["title"])
+    assert erro.tipo_excecao is None
+    assert erro.duracao_ms is not None and erro.duracao_ms >= 0
+    assert erro.ambiente == get_settings().app_env
+    assert "982" not in repr(erro) and "Fulano" not in repr(erro)
 
 
-async def test_cada_erro_leva_a_chave_da_sua_movimentacao(cliente: AsyncClient, gravador: GravadorFalso) -> None:
+async def test_cada_erro_e_gravado_junto_com_a_sua_movimentacao(
+    cliente: AsyncClient, repo: RepositorioFalso, movimentacao: Movimentacao
+) -> None:
     primeira = await cliente.post(URL, json={"documento": "529.982.247-24"}, headers=CABECALHOS)
     segunda = await cliente.get("/nao-existe", headers=CABECALHOS)
+    await movimentacao.parar()
 
-    assert [(r.ano, r.requisicao) for r in gravador.registros] == [(ANO_FALSO, 1), (ANO_FALSO, 2)]
-    assert primeira.headers["x-requisicao"] == f"{ANO_FALSO}-000001"
-    assert segunda.headers["x-requisicao"] == f"{ANO_FALSO}-000002"
+    for resposta, codigo in ((primeira, "entrada_invalida"), (segunda, "http_404")):
+        gravada = repo.movimentacao.por_id(id_do_header(resposta))
+        assert gravada.erro is not None and gravada.erro.codigo == codigo
+        assert gravada.erro.status == gravada.status_http == resposta.status_code
 
 
-async def test_sucesso_e_health_nao_registram(cliente: AsyncClient, gravador: GravadorFalso) -> None:
+async def test_sucesso_e_health_nao_geram_erro(
+    cliente: AsyncClient, repo: RepositorioFalso, movimentacao: Movimentacao
+) -> None:
     assert (await cliente.post(URL, json={"documento": CPF_VALIDO}, headers=CABECALHOS)).status_code == 200
     assert (await cliente.get("/health/live")).status_code == 200
     assert (await cliente.get("/health/ready")).status_code == 200
-    assert gravador.registros == []
+    await movimentacao.parar()
+
+    assert len(repo.movimentacao.registros) == 1 and _erros(repo) == []
 
 
-async def test_erros_do_framework_e_do_middleware_registram(cliente: AsyncClient, gravador: GravadorFalso) -> None:
+async def test_erros_do_framework_e_do_middleware_registram(
+    cliente: AsyncClient, repo: RepositorioFalso, movimentacao: Movimentacao
+) -> None:
     await cliente.post(URL, json={"documento": CPF_VALIDO})  # 401 sem chave: não entra (sem movimentação)
     await cliente.get("/nao-existe", headers=CABECALHOS)  # 404
     await cliente.get(URL, headers=CABECALHOS)  # 405
@@ -57,8 +74,9 @@ async def test_erros_do_framework_e_do_middleware_registram(cliente: AsyncClient
     await cliente.post(  # 413, respondido pelo middleware
         URL, content=b"{" + b" " * 5000 + b"}", headers={**CABECALHOS, "Content-Type": "application/json"}
     )
+    await movimentacao.parar()
 
-    assert [(r.status, r.codigo, r.rota) for r in gravador.registros] == [
+    assert [(e.status, e.codigo, e.rota) for e in _erros(repo)] == [
         (404, "http_404", "/nao-existe"),
         (405, "http_405", URL),
         (400, "requisicao_invalida", URL),
@@ -67,38 +85,34 @@ async def test_erros_do_framework_e_do_middleware_registram(cliente: AsyncClient
 
 
 async def test_erro_interno_registra_o_tipo_da_excecao(
-    cliente: AsyncClient, repo: RepositorioFalso, gravador: GravadorFalso
+    cliente: AsyncClient, repo: RepositorioFalso, movimentacao: Movimentacao
 ) -> None:
     repo.erro_inesperado = RuntimeError("detalhe interno: senha=abc")
     resposta = await cliente.post(URL, json={"documento": CPF_VALIDO}, headers=CABECALHOS)
+    await movimentacao.parar()
 
     assert resposta.status_code == 500
-    (registro,) = gravador.registros
-    assert (registro.codigo, registro.tipo_excecao) == ("erro_interno", "builtins.RuntimeError")
-    assert "senha" not in repr(registro)
+    (erro,) = _erros(repo)
+    assert (erro.codigo, erro.tipo_excecao) == ("erro_interno", "builtins.RuntimeError")
+    assert "senha" not in repr(erro)
 
 
-async def test_banco_fora_registra_503(cliente: AsyncClient, repo: RepositorioFalso, gravador: GravadorFalso) -> None:
+async def test_banco_fora_registra_503(
+    cliente: AsyncClient, repo: RepositorioFalso, movimentacao: Movimentacao
+) -> None:
     repo.falhar = True
     await cliente.post(URL, json={"documento": CPF_VALIDO}, headers=CABECALHOS)
+    await movimentacao.parar()
 
-    assert [(r.status, r.codigo) for r in gravador.registros] == [(503, "banco_indisponivel")]
-
-
-async def test_rota_muito_longa_e_truncada(cliente: AsyncClient, gravador: GravadorFalso) -> None:
-    await cliente.get("/" + "a" * 500, headers=CABECALHOS)
-
-    (registro,) = gravador.registros
-    assert registro.status == 404 and len(registro.rota) == 200
+    assert [(e.status, e.codigo) for e in _erros(repo)] == [(503, "banco_indisponivel")]
 
 
-async def test_sem_numero_de_requisicao_o_erro_nao_e_gravado(
-    cliente: AsyncClient, repo: RepositorioFalso, gravador: GravadorFalso
+async def test_rota_muito_longa_e_truncada(
+    cliente: AsyncClient, repo: RepositorioFalso, movimentacao: Movimentacao
 ) -> None:
-    # Banco fora na chegada: a API segue (a resposta de erro sai normal), mas a log_erros não recebe linha sem chave.
-    repo.numeracao_falha = True
-    resposta = await cliente.post(URL, json={"documento": "529.982.247-24"}, headers=CABECALHOS)
+    await cliente.get("/" + "a" * 500, headers=CABECALHOS)
+    await movimentacao.parar()
 
-    assert resposta.status_code == 422
-    assert "x-requisicao" not in resposta.headers
-    assert gravador.registros == []
+    (gravada,) = repo.movimentacao.registros
+    assert gravada.status_http == 404 and len(gravada.rota) == 200
+    assert gravada.erro is not None and len(gravada.erro.rota) == 200

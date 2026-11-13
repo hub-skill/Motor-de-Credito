@@ -5,6 +5,7 @@ exceções dos drivers para os casos que exigiriam um banco lento ou quebrado.
 """
 
 import os
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import oracledb
@@ -17,7 +18,8 @@ from psycopg_pool import PoolTimeout
 import app.main as modulo_main
 from app.core.config import Settings, get_settings
 from app.core.exceptions import BancoExpirou, BancoIndisponivel
-from app.repositorios.base import RegistroErro, RegistroResposta
+from app.movimentacao.postgres import MovimentacaoPostgres
+from app.movimentacao.registros import RegistroErro, RegistroMovimentacao
 from app.repositorios.erros_oracle import oracle_codigo_do_erro, oracle_indisponivel, traduzir_erros_oracle
 from app.repositorios.erros_postgres import pg_erro_de_conexao, traduzir_erros_postgres
 from app.repositorios.oracle import RepositorioOracle
@@ -56,32 +58,27 @@ async def test_repositorio_oracle_fora_do_ar_vira_banco_indisponivel() -> None:
         await repo.fechar()
 
 
-_REGISTRO = RegistroErro(
-    2026, 1, "r1", "POST", "/api/v1/triagem", 503, "banco_indisponivel", "Banco fora.", None, 1, "dev"
+_AGORA = datetime.now(UTC)
+_ERRO = RegistroErro("r1", "POST", "/api/v1/triagem", 503, "banco_indisponivel", "Banco fora.", None, 1, "dev")
+_REGISTRO = RegistroMovimentacao(
+    "01JC4M7Z9Q8T2X5V6B3N0WYKHD", "POST", "/api/v1/triagem", "{}", _AGORA, 503, "{}", _AGORA, "OK", "ER", _ERRO
 )
-_RESPOSTA = RegistroResposta(2026, 1, 503, "{}", "OK", "ER")
-
-
-async def test_log_de_erros_com_banco_fora_vira_banco_indisponivel() -> None:
-    # O GravadorDeErros captura a exceção; aqui só se confere que o driver não vaza o erro cru.
-    for repo in (await RepositorioPostgres.criar(_settings()), await RepositorioOracle.criar(_settings())):
-        try:
-            with pytest.raises(BancoIndisponivel):
-                await repo.gravar_erros([_REGISTRO])
-        finally:
-            await repo.fechar()
 
 
 async def test_movimentacao_com_banco_fora_vira_banco_indisponivel() -> None:
-    # Numerar a chegada e gravar a resposta com o banco fora: exceção traduzida, nunca o erro cru do driver.
+    # A gravação em segundo plano captura a exceção; aqui só se confere que o driver não vaza o erro cru.
     for repo in (await RepositorioPostgres.criar(_settings()), await RepositorioOracle.criar(_settings())):
         try:
             with pytest.raises(BancoIndisponivel):
-                await repo.registrar_requisicao("POST", "/api/v1/triagem", "{}")
-            with pytest.raises(BancoIndisponivel):
-                await repo.registrar_respostas([_RESPOSTA])
+                await repo.movimentacao.gravar([_REGISTRO])
         finally:
             await repo.fechar()
+
+
+def test_nome_de_esquema_invalido_e_recusado() -> None:
+    # O nome do schema entra no SQL: só identificador simples.
+    with pytest.raises(ValueError, match="esquema"):
+        MovimentacaoPostgres(None, "app; drop table x")  # type: ignore[arg-type]
 
 
 # --- PostgreSQL: exceções do driver ---

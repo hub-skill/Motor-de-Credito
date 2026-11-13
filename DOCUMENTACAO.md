@@ -223,7 +223,7 @@ Mantenha `REQUEST_TIMEOUT_SECONDS` **maior** que a espera do pool (5 s): com o b
 | Header | Valor |
 |---|---|
 | `X-Request-ID` | Identificador da requisição. **Informe ao suporte** em caso de erro |
-| `X-Requisicao` | Número da requisição na movimentação (ex.: `2026-000123`). **Informe ao suporte** também. Ausente se a chave de API falta ou é inválida, se a rota é `/health` ou `/metrics`, ou se o banco não deu o número a tempo (ver seção 6) |
+| `X-Requisicao` | ULID da requisição na movimentação (26 caracteres, ex.: `01JC4M7Z9Q8T2X5V6B3N0WYKHD`), gerado pela API. **Informe ao suporte** também. Ausente se a chave de API falta ou é inválida, ou se a rota é `/health` ou `/metrics` (ver seção 6) |
 | `Cache-Control: no-store` | A resposta tem dados pessoais: não guarde em cache |
 | `X-Content-Type-Options` / `X-Frame-Options` / `Strict-Transport-Security` | Proteções do navegador |
 | `Retry-After` | Nas respostas 429: segundos até poder tentar de novo |
@@ -292,73 +292,73 @@ triagem**: trate como pendente.
 ### Movimentação: o que chegou e o que a API respondeu
 
 Cada requisição **com chave de API válida** é registrada na tabela `movimentacao`, menos `/health/*` e `/metrics`
-(as sondas chamam a cada poucos segundos): primeiro o que chegou, depois o que a API respondeu, **na mesma linha**.
-Chamadas sem chave ou com chave errada (inclusive varreduras de rotas) recebem 401 e **não** são registradas, nem na
-movimentação nem na `log_erros`: só aparecem no log da aplicação.
+(as sondas chamam a cada poucos segundos): o que chegou, o que a API respondeu e, se foi erro (4xx ou 5xx), os
+metadados do erro na tabela `log_erros`, **tudo numa só gravação**, feita em segundo plano depois da resposta.
+Chamadas sem chave ou com chave errada (inclusive varreduras de rotas) recebem 401 e **não** são registradas: só
+aparecem no log da aplicação.
 
 | Banco | Tabelas |
 |---|---|
-| PostgreSQL | `credito.movimentacao` e `credito.contador_requisicao` |
-| Oracle | `motor_credito.movimentacao` e `motor_credito.contador_requisicao` |
+| PostgreSQL | `credito.movimentacao` e `credito.log_erros` |
+| Oracle | `motor_credito.movimentacao` e `motor_credito.log_erros` |
 
-| Coluna | Conteúdo |
+| Coluna da `movimentacao` | Conteúdo |
 |---|---|
-| `ano`, `requisicao` | A chave. `requisicao` é um contador que volta a 1 em todo ano novo (o ano é o do horário de Brasília). O cliente recebe o número no header `X-Requisicao` (ex.: `2026-000123`) |
+| `requisicao_id` | A chave: um **ULID** de 26 caracteres (ex.: `01JC4M7Z9Q8T2X5V6B3N0WYKHD`), **gerado pela própria API** na chegada e devolvido ao cliente no header `X-Requisicao`. Carrega a hora de chegada e, em ordem alfabética, é a ordem cronológica. Não é sequencial e não reinicia a cada ano |
 | `metodo`, `rota` | Método e caminho pedido (sem a query string, até 200 caracteres) |
-| `requisicao_conteudo`, `requisicao_em` | O que foi enviado, em qualquer formato (texto), e o momento em que chegou |
-| `situacao_requisicao` | `OK` = aceita; `ER` = recusada (respostas 4xx: JSON inválido, entrada inválida, limite excedido...). Vazia até a resposta |
-| `status_http`, `resposta_conteudo`, `resposta_em` | Status, corpo e momento da resposta. `resposta_em` vazio = a API não chegou a responder (caiu no meio) ou a gravação da resposta se perdeu |
+| `requisicao_conteudo`, `requisicao_em` | O que foi enviado, em qualquer formato (texto), e o momento em que chegou (com fuso: `timestamptz` / `TIMESTAMP WITH TIME ZONE`) |
+| `situacao_requisicao` | `OK` = aceita; `ER` = recusada (respostas 4xx: JSON inválido, entrada inválida, limite excedido...) |
+| `status_http`, `resposta_conteudo`, `resposta_em` | Status, corpo e momento da resposta |
 | `situacao_resposta` | `OK` = sucesso (2xx); `ER` = erro (4xx ou 5xx). Uma falha do servidor (5xx) fica `OK` na requisição e `ER` na resposta |
 
-- **Numeração e chegada** são gravadas na hora, num único comando do banco: duas requisições ao mesmo tempo nunca
-  recebem o mesmo número. A API espera o banco por até **1 segundo**; sem número nesse prazo (banco fora ou lento), a
-  requisição segue normalmente, **sem movimentação e sem o header `X-Requisicao`** (aviso `requisição sem número na
-  movimentação` no log da aplicação).
-- **A resposta** completa a linha em segundo plano (fila de até 1000, lotes de 100): o cliente não espera por ela.
-  Com o banco fora, a fila enche e as respostas a mais se perdem (aviso no log). Uma resposta já gravada nunca é
-  sobrescrita.
+- **O número nasce na API**: nunca depende do banco. Com o banco fora ou lento, a resposta sai normalmente, com o
+  header `X-Requisicao`; as gravações ficam numa fila em memória (até 1000, em lotes de 100) e, com o banco fora, as
+  a mais se perdem (aviso `fila da movimentação cheia` ou `falha ao gravar a movimentação no banco` no log). A
+  gravação nunca derruba a API. Ao desligar, a API grava o que ainda estiver na fila (até 5 s).
+- **A chegada não é gravada antes do processamento**: se o processo cair no meio de uma requisição, ela só existe no
+  log da aplicação. Se for exigida a numeração sequencial por ano, ou saber de requisições que não terminaram, este
+  desenho não serve.
 - **Conteúdo**: texto em qualquer formato (JSON malformado, XML...), até 32 KB (acima disso é cortado, com aviso no
   fim). Corpo acima do limite da API (4 KB) não é lido: só o tamanho fica gravado. **Todo CPF é mascarado**
   (`***.982.247-**`), em qualquer formato, na requisição e na resposta. A chave de API vai num header e nunca é gravada.
   **O nome enviado é gravado como veio.**
-- **Permissão**: o usuário da aplicação (`motor_app / MOTOR_APP`) não tem acesso às tabelas; só executa as duas funções/procedures
-  (`registrar_requisicao` e `registrar_resposta`). Consultas e limpeza são feitas por um administrador.
-- **Consultar** uma requisição relatada pelo cliente: `select * from credito.movimentacao where ano = 2026 and requisicao = 123`.
+- **Permissão**: o usuário da aplicação (`motor_app / MOTOR_APP`) só tem **INSERT** nas duas tabelas: não lê, não
+  altera e não apaga. Consultas e limpeza são feitas por um administrador. No Oracle, ele enxerga as tabelas pelos
+  sinônimos.
+- **Consultar** uma requisição relatada pelo cliente: `select * from credito.movimentacao where requisicao_id = '01JC4M7Z9Q8T2X5V6B3N0WYKHD'`.
 - **Limpeza** (o volume cresce com cada chamada). Exemplo, manter 90 dias, apagando primeiro o log de erros:
   `delete from credito.log_erros where ocorrido_em < now() - interval '90 days'` e depois
   `delete from credito.movimentacao where requisicao_em < now() - interval '90 days'` (PostgreSQL); no Oracle,
   `... WHERE requisicao_em < SYSTIMESTAMP - INTERVAL '90' DAY` nas tabelas de `motor_credito`.
-- **Custo**: gravar a chegada de cada requisição é uma escrita no banco dentro do atendimento. Medido em 12/11/2026
-  (notebook de 2 núcleos, PostgreSQL, gerador de carga no mesmo computador, antes x depois): a vazão máxima caiu de ~200 para ~140 requisições por segundo (de 201,5 para 143,8 com 16 clientes simultâneos, -29%; com 4 clientes, de 193,7 para 127,1, -34%). O Oracle não foi
-  medido. Se a vazão virar problema, as saídas são uma conexão própria só para essas escritas e confirmar a gravação
-  sem esperar o disco (`synchronous_commit = off`, que aceita perder as últimas centenas de milissegundos num
-  desligamento brusco).
+- **Custo**: a gravação sai do caminho da resposta (a versão anterior numerava no banco a cada chamada e perdia de 29% a
+  34% da vazão máxima, medido em 12/11/2026). A escrita de cada lote é uma transação curta, em segundo plano. Medido em
+  13/11/2026 com a versão 2 (mesmo notebook de 2 núcleos, PostgreSQL, uma rodada de 10 s por degrau): **~146 req/s com 4
+  clientes e ~212 com 16**, contra ~127 e ~144 da versão 1 (e ~194 e ~202 sem movimentação). Com ~200 req/s a fila de gravação
+  chega perto de acumular centenas de registros (o gravador roda no mesmo processo): acima disso, a fila (1000) enche e as
+  gravações a mais são descartadas, por desenho.
+- **Migração da versão anterior** (ano + contador): os scripts `03_movimentacao.sql` não convertem dados. Os objetos
+  antigos (`contador_requisicao`, `log_erros_v1`, as funções/procedures `registrar_requisicao` e `registrar_resposta`
+  e os sinônimos) foram removidos do banco em 13/11/2026; os comandos estão no cabeçalho de cada script.
 
 ### Log de erros no banco
 
-Toda resposta de erro (4xx e 5xx) é gravada na tabela `log_erros`, no mesmo banco que a API estiver usando:
+Toda resposta de erro (4xx e 5xx) de uma requisição com movimentação é gravada na tabela `log_erros`, **junto com a
+sua movimentação** (mesma transação):
 
 | Banco | Tabela |
 |---|---|
 | PostgreSQL | `credito.log_erros` |
 | Oracle | `motor_credito.log_erros` |
 
-Colunas: `ano` e `requisicao` (as duas primeiras: a chave da movimentação do erro, **obrigatórias**), `id`,
-`ocorrido_em`, `request_id` (o mesmo devolvido ao cliente), `metodo`, `rota`, `status`, `codigo`, `titulo`,
-`tipo_excecao` (só no 500), `duracao_ms` e `ambiente` (`APP_ENV`). **Nunca** grava CPF, CNPJ, nome ou o corpo da
-requisição (o corpo, mascarado, fica na movimentação). As tabelas são criadas por `banco/criar_tabelas.py` (scripts `03_movimentacao.sql` e `04_log_erros.sql`).
+Colunas: `requisicao_id` (chave estrangeira para a `movimentacao`: o erro nunca existe sem ela), `id`, `ocorrido_em`,
+`request_id` (o mesmo devolvido ao cliente), `metodo`, `rota`, `status`, `codigo`, `titulo`, `tipo_excecao` (só no
+500), `duracao_ms` e `ambiente` (`APP_ENV`). **Nunca** grava CPF, CNPJ, nome ou o corpo da requisição (o corpo,
+mascarado, fica na movimentação). As duas tabelas são criadas por `banco/criar_tabelas.py` (script `03_movimentacao.sql`).
 
-- **Sem número de requisição, o erro não é gravado aqui**: se a chamada veio sem chave válida (401) ou o banco
-  estava fora ou lento na chegada (ver movimentação), o erro aparece só no log da aplicação. A tabela nunca tem linha sem `ano` e `requisicao`.
-- A resposta não espera o banco: o erro entra numa fila em memória (até 1000) e é gravado em lotes de até 100.
-  Com o banco fora ou lento, a fila enche e os registros a mais são descartados (aviso no log da aplicação);
-  a API continua respondendo normalmente. Ao desligar, a API grava o que ainda estiver na fila (até 5 s).
-- O usuário da aplicação (`motor_app / MOTOR_APP`) só tem **INSERT** nessa tabela: não lê, não altera e não apaga. Consultas e
-  limpeza são feitas por um administrador.
-- Para achar o erro que um cliente relatou: `select * from credito.log_erros where ano = 2026 and requisicao = 123`
+- Chamadas sem chave válida (401) e rotas `/health` e `/metrics` não têm movimentação e, por isso, nem linha na
+  `log_erros`: o erro aparece só no log da aplicação.
+- Para achar o erro que um cliente relatou: `select * from credito.log_erros where requisicao_id = '<ULID do X-Requisicao>'`
   (ou pelo `request_id`), e a requisição completa em `credito.movimentacao` com a mesma chave.
-- A versão anterior da tabela (sem a chave) ficou guardada como `log_erros_v1`, sem acesso da aplicação: as linhas
-  dela não têm movimentação e não foram copiadas. Apague quando quiser (`drop table credito.log_erros_v1`).
 - Limpeza: ver a da movimentação (o log de erros é apagado primeiro).
 
 ---
@@ -502,9 +502,8 @@ reinícios.
 - `/health/ready` no balanceador/orquestrador (tira a instância de rotação se o banco cair).
 - `/metrics` no Prometheus: acompanhe taxa de 503/504 e latência.
 - Tabelas `movimentacao` e `log_erros` (seção 6): o que chegou, o que foi respondido e os erros, pela chave
-  (`ano`, `requisicao`) do header `X-Requisicao`. Avisos `requisição sem número na movimentação`, `fila da
-  movimentação cheia`, `fila do log de erros cheia` ou `falha ao gravar ... no banco` no log da aplicação indicam
-  que o banco não está recebendo os registros.
+  `requisicao_id` (o ULID do header `X-Requisicao`). Os avisos `fila da movimentação cheia` ou `falha ao gravar a
+  movimentação no banco` no log da aplicação indicam que o banco não está recebendo os registros.
 - Logs em JSON com `request_id`; falhas de banco aparecem como `postgres indisponível` ou `erro oracle` com o
   código (`codigo_oracle`), nunca com a senha.
 
@@ -545,8 +544,7 @@ definidas têm prioridade.
 - Logs em JSON, sem dados pessoais e sem segredos; o objeto de conexão do psycopg (`pgconn`), que contém a senha,
   nunca é registrado.
 - A API só lê as listas: no PostgreSQL a sessão abre como `read only`; no Oracle o usuário `MOTOR_APP` só tem
-  `SELECT` pelos sinônimos. As únicas escritas são a movimentação (o usuário só executa as duas funções, sem acesso
-  às tabelas) e o log de erros (só `INSERT`).
+  `SELECT` pelos sinônimos. As únicas escritas são a movimentação e o log de erros (só `INSERT` nas duas tabelas).
 - **A movimentação guarda o que foi enviado**: o CPF é gravado mascarado, mas o **nome** vai como veio, junto com o
   momento da consulta. Defina por quanto tempo guardar (a limpeza está na seção 6), restrinja o acesso às tabelas a
   quem precisa (auditoria e suporte) e registre a finalidade e o prazo de retenção.
@@ -585,7 +583,7 @@ definidas têm prioridade.
 | `ORA-12514` / `DPY-6001` | DSN apontando para o CDB ou serviço errado | `ORACLE_DSN=localhost:1521/XEPDB1` |
 | `PEP não verificado` em CPF | Nome não enviado | Enviar `nome` |
 | `pip-audit` aponta vulnerabilidade | Dependência com falha conhecida | Atualizar no `pyproject.toml` e rodar `uv lock` |
-| Resposta sem o header `X-Requisicao` | Chamada sem chave válida, rota `/health` ou `/metrics`, ou banco fora/lento na chegada (passou de 1 s) | Ver o aviso `requisição sem número na movimentação` no log e conferir o banco |
-| `resposta_em` vazio na movimentação | A API caiu antes de responder, ou a gravação da resposta se perdeu | Ver os avisos `fila da movimentação cheia` e `falha ao gravar a resposta na movimentação` |
+| Resposta sem o header `X-Requisicao` | Chamada sem chave válida, ou rota `/health` ou `/metrics` | Conferir a chave de API; essas rotas não entram na movimentação |
+| O `X-Requisicao` do cliente não está na tabela `movimentacao` | O banco estava fora ou lento (a fila encheu), ou a API caiu antes de gravar | Ver os avisos `fila da movimentação cheia` e `falha ao gravar a movimentação no banco` no log da aplicação |
 
 Ao abrir chamado, informe o **`request_id`** e o **`X-Requisicao`** (ou o header `X-Request-ID`), a data e a hora.

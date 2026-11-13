@@ -1,12 +1,12 @@
 """Testes contra os bancos reais (dados da carga da CGU). Rode com: pytest -m bancos --no-cov
 
-Leem as credenciais do .env da pasta do projeto. Só leitura, exceto o log de erros (só insert).
+Leem as credenciais do .env da pasta do projeto. Só leitura, exceto a movimentação e o log de erros (só insert).
 """
 
 import asyncio
 import os
 from collections.abc import AsyncIterator, Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,9 @@ import pytest_asyncio
 from dotenv import dotenv_values
 
 from app.core.config import Settings
-from app.repositorios.base import RegistroErro, RegistroResposta, RepositorioListas
+from app.movimentacao import ulid
+from app.movimentacao.registros import RegistroErro, RegistroMovimentacao
+from app.repositorios.base import RepositorioListas
 from app.repositorios.oracle import RepositorioOracle
 from app.repositorios.postgres import RepositorioPostgres
 
@@ -78,7 +80,6 @@ ENV_ADMIN = {
     and "ADMIN" in k
     or k in ("PG_HOST", "PG_PORT", "PG_DATABASE", "ORACLE_DSN")
 }
-ANO_ATUAL = datetime.now(timezone(timedelta(hours=-3))).year  # horário de Brasília (sem horário de verão)
 
 
 def _oracle_clob_como_texto(cursor: oracledb.Cursor, metadata: oracledb.FetchInfo) -> object:
@@ -118,112 +119,156 @@ def _admin(repo: RepositorioListas, sql: str, *params: object) -> list[tuple[Any
         return [tuple(linha) for linha in linhas]
 
 
-NOMES_MOVIMENTACAO = (
-    "metodo",
-    "rota",
-    "requisicao_conteudo",
-    "situacao_requisicao",
-    "status_http",
-    "resposta_conteudo",
-    "resposta_em",
-    "situacao_resposta",
-    "requisicao_em",
-)
-SQL_MOVIMENTACAO = (
-    "select metodo, rota, requisicao_conteudo, situacao_requisicao, status_http, resposta_conteudo,"
-    " resposta_em, situacao_resposta, requisicao_em from {m} where ano = ? and requisicao = ?"
-)
+def _utc(repo: RepositorioListas, coluna: str) -> str:
+    """Expressão SQL que devolve o instante da coluna como texto em UTC (sem depender do fuso de quem lê)."""
+    if isinstance(repo, RepositorioPostgres):
+        return f"to_char({coluna} at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US')"
+    return f"to_char(sys_extract_utc({coluna}), 'YYYY-MM-DD\"T\"HH24:MI:SS.FF6')"
 
 
-def _movimentacao(repo: RepositorioListas, ano: int, requisicao: int) -> dict[str, Any]:
-    (linha,) = _admin(repo, SQL_MOVIMENTACAO, ano, requisicao)
-    return dict(zip(NOMES_MOVIMENTACAO, linha, strict=True))
+def _instante(texto: str) -> datetime:
+    return datetime.fromisoformat(texto).replace(tzinfo=UTC)
+
+
+def _movimentacao(repo: RepositorioListas, requisicao_id: str) -> dict[str, Any]:
+    (linha,) = _admin(
+        repo,
+        "select metodo, rota, requisicao_conteudo, situacao_requisicao, status_http, resposta_conteudo,"
+        f" situacao_resposta, {_utc(repo, 'requisicao_em')}, {_utc(repo, 'resposta_em')}"
+        " from {m} where requisicao_id = ?",
+        requisicao_id,
+    )
+    nomes = (
+        "metodo",
+        "rota",
+        "requisicao_conteudo",
+        "situacao_requisicao",
+        "status_http",
+        "resposta_conteudo",
+        "situacao_resposta",
+        "requisicao_em",
+        "resposta_em",
+    )
+    resultado = dict(zip(nomes, linha, strict=True))
+    resultado["requisicao_em"] = _instante(resultado["requisicao_em"])
+    resultado["resposta_em"] = _instante(resultado["resposta_em"])
+    return resultado
+
+
+def _registro(
+    conteudo: str | None = "{}", status: int = 200, erro: RegistroErro | None = None, requisicao_id: str | None = None
+) -> RegistroMovimentacao:
+    chegada = datetime.now(UTC)
+    situacao_requisicao = "ER" if 400 <= status < 500 else "OK"
+    return RegistroMovimentacao(
+        requisicao_id or ulid.novo(chegada),
+        "POST",
+        "/api/v1/triagem",
+        conteudo,
+        chegada,
+        status,
+        conteudo,
+        chegada + timedelta(milliseconds=7),
+        situacao_requisicao,
+        "OK" if status < 400 else "ER",
+        erro,
+    )
 
 
 @pytest.fixture
-def limpeza(repo: RepositorioListas) -> Iterator[list[tuple[int, int]]]:
-    """Chaves (ano, requisicao) criadas pelo teste: apagadas no fim (log_erros primeiro, por causa da chave)."""
-    chaves: list[tuple[int, int]] = []
-    yield chaves
-    for ano, requisicao in chaves:
-        _admin(repo, "delete from {l} where ano = ? and requisicao = ?", ano, requisicao)
-        _admin(repo, "delete from {m} where ano = ? and requisicao = ?", ano, requisicao)
+def limpeza(repo: RepositorioListas) -> Iterator[list[str]]:
+    """ULID criados pelo teste: apagados no fim (log_erros primeiro, por causa da chave estrangeira)."""
+    ids: list[str] = []
+    yield ids
+    for requisicao_id in ids:
+        _admin(repo, "delete from {l} where requisicao_id = ?", requisicao_id)
+        _admin(repo, "delete from {m} where requisicao_id = ?", requisicao_id)
 
 
-async def test_requisicao_e_numerada_e_a_chegada_e_gravada(
-    repo: RepositorioListas, limpeza: list[tuple[int, int]]
+async def test_lote_grava_a_movimentacao_com_os_instantes_e_o_erro_junto(
+    repo: RepositorioListas, limpeza: list[str]
 ) -> None:
-    ano, numero = await repo.registrar_requisicao("POST", "/api/v1/triagem", '{"documento": "***.982.247-**"}')
-    limpeza.append((ano, numero))
+    erro = RegistroErro(
+        "teste-bancos-1", "POST", "/api/v1/triagem", 422, "entrada_invalida", "Dados inválidos.", None, 5, "teste"
+    )
+    sucesso = _registro('{"documento": "***.982.247-**"}')
+    recusada = _registro('{"documento": "x"}', status=422, erro=erro)
+    limpeza.extend([sucesso.requisicao_id, recusada.requisicao_id])
 
-    assert ano == ANO_ATUAL and numero >= 1
-    linha = _movimentacao(repo, ano, numero)
-    assert (linha["metodo"], linha["rota"]) == ("POST", "/api/v1/triagem")
-    assert linha["requisicao_conteudo"] == '{"documento": "***.982.247-**"}'
-    assert linha["requisicao_em"] is not None
-    # Na chegada a resposta e as duas situações ainda não existem.
-    assert linha["resposta_em"] is None and linha["status_http"] is None
-    assert linha["situacao_requisicao"] is None and linha["situacao_resposta"] is None
+    await repo.movimentacao.gravar([sucesso, recusada])
 
+    linha = _movimentacao(repo, sucesso.requisicao_id)
+    assert (linha["metodo"], linha["rota"], linha["status_http"]) == ("POST", "/api/v1/triagem", 200)
+    assert linha["requisicao_conteudo"] == linha["resposta_conteudo"] == '{"documento": "***.982.247-**"}'
+    assert (linha["situacao_requisicao"], linha["situacao_resposta"]) == ("OK", "OK")
+    # Os instantes chegam ao banco como o mesmo momento (com fuso), não como hora local sem fuso.
+    assert linha["requisicao_em"] == sucesso.requisicao_em
+    assert linha["resposta_em"] == sucesso.resposta_em
+    assert _admin(repo, "select count(*) from {l} where requisicao_id = ?", sucesso.requisicao_id) == [(0,)]
 
-async def test_resposta_completa_a_mesma_linha_uma_vez_so(
-    repo: RepositorioListas, limpeza: list[tuple[int, int]]
-) -> None:
-    ano, numero = await repo.registrar_requisicao("POST", "/api/v1/triagem", "{}")
-    limpeza.append((ano, numero))
-
-    await repo.registrar_respostas([RegistroResposta(ano, numero, 422, '{"code": "entrada_invalida"}', "ER", "ER")])
-    linha = _movimentacao(repo, ano, numero)
-    assert (linha["status_http"], linha["situacao_requisicao"], linha["situacao_resposta"]) == (422, "ER", "ER")
-    assert linha["resposta_conteudo"] == '{"code": "entrada_invalida"}'
-    assert linha["resposta_em"] is not None and linha["resposta_em"] >= linha["requisicao_em"]
-
-    # Uma segunda resposta para a mesma requisição não sobrescreve a primeira.
-    await repo.registrar_respostas([RegistroResposta(ano, numero, 200, "outra", "OK", "OK")])
-    assert _movimentacao(repo, ano, numero)["resposta_conteudo"] == '{"code": "entrada_invalida"}'
-
-
-async def test_requisicoes_ao_mesmo_tempo_recebem_numeros_diferentes(
-    repo: RepositorioListas, limpeza: list[tuple[int, int]]
-) -> None:
-    chaves = await asyncio.gather(*(repo.registrar_requisicao("GET", f"/x/{n}", None) for n in range(20)))
-    limpeza.extend(chaves)
-
-    assert len({chave for chave in chaves}) == 20
-    assert {ano for ano, _ in chaves} == {ANO_ATUAL}
+    assert _movimentacao(repo, recusada.requisicao_id)["situacao_requisicao"] == "ER"
+    linhas = _admin(
+        repo,
+        "select request_id, status, codigo, titulo, tipo_excecao, duracao_ms, ambiente"
+        " from {l} where requisicao_id = ?",
+        recusada.requisicao_id,
+    )
+    assert [tuple(x) for x in linhas] == [
+        ("teste-bancos-1", 422, "entrada_invalida", "Dados inválidos.", None, 5, "teste")
+    ]
 
 
 async def test_conteudo_aceita_qualquer_formato_e_tamanho_e_pode_ser_nulo(
-    repo: RepositorioListas, limpeza: list[tuple[int, int]]
+    repo: RepositorioListas, limpeza: list[str]
 ) -> None:
     grande = "ação é ç " * 3500  # ~32 mil caracteres: passa de 32767 bytes (limite de texto comum do Oracle)
     xml = '<?xml version="1.0"?><a b="1">ç</a>'
-    for conteudo in (grande, xml, None):
-        ano, numero = await repo.registrar_requisicao("POST", "/x", conteudo)
-        limpeza.append((ano, numero))
-        await repo.registrar_respostas([RegistroResposta(ano, numero, 200, conteudo, "OK", "OK")])
+    registros = [_registro(conteudo) for conteudo in (grande, xml, None)]
+    limpeza.extend(r.requisicao_id for r in registros)
 
-        linha = _movimentacao(repo, ano, numero)
-        assert linha["requisicao_conteudo"] == conteudo
-        assert linha["resposta_conteudo"] == conteudo
+    await repo.movimentacao.gravar(registros)
+
+    for registro in registros:
+        linha = _movimentacao(repo, registro.requisicao_id)
+        assert linha["requisicao_conteudo"] == registro.requisicao_conteudo
+        assert linha["resposta_conteudo"] == registro.resposta_conteudo
 
 
-# Acessos que o usuário da aplicação NÃO pode ter: ela só executa as funções/procedures da movimentação.
-ACESSOS_NEGADOS_POSTGRES = (
-    "select count(*) from credito.movimentacao",
-    "select count(*) from credito.contador_requisicao",
-    "update credito.contador_requisicao set ultimo = 1",
-    "delete from credito.movimentacao",
+async def test_ulid_repetido_recusa_o_lote_inteiro(repo: RepositorioListas, limpeza: list[str]) -> None:
+    primeiro = _registro()
+    limpeza.append(primeiro.requisicao_id)
+    await repo.movimentacao.gravar([primeiro])
+
+    novo = _registro()
+    limpeza.append(novo.requisicao_id)
+    with pytest.raises(Exception):  # noqa: B017, PT011 - chave primária repetida, cada driver com a sua exceção
+        await repo.movimentacao.gravar([novo, _registro(requisicao_id=primeiro.requisicao_id)])
+
+    # Uma transação só: o registro novo do mesmo lote também não ficou.
+    assert _admin(repo, "select count(*) from {m} where requisicao_id = ?", novo.requisicao_id) == [(0,)]
+
+
+async def test_lotes_ao_mesmo_tempo_gravam_tudo(repo: RepositorioListas, limpeza: list[str]) -> None:
+    lotes = [[_registro() for _ in range(5)] for _ in range(6)]
+    limpeza.extend(r.requisicao_id for lote in lotes for r in lote)
+
+    await asyncio.gather(*(repo.movimentacao.gravar(lote) for lote in lotes))
+
+    ids = [r.requisicao_id for lote in lotes for r in lote]
+    assert _admin(repo, "select count(*) from {m} where requisicao_id in (" + ", ".join("?" * 30) + ")", *ids) == [
+        (30,)
+    ]
+
+
+# O usuário da aplicação só insere: sem select, update ou delete nas duas tabelas.
+ACESSOS_NEGADOS = (
+    "select count(*) from {t}",
+    "update {t} set rota = 'x'",
+    "delete from {t}",
 )
-ACESSOS_NEGADOS_ORACLE = (
-    "select count(*) from movimentacao",
-    "select count(*) from contador_requisicao",
-    "update contador_requisicao set ultimo = 1",
-    "delete from movimentacao",
-)
 
 
-async def test_aplicacao_nao_le_nem_altera_a_movimentacao(repo: RepositorioListas) -> None:
+async def test_aplicacao_so_insere_na_movimentacao_e_no_log_de_erros(repo: RepositorioListas) -> None:
     if isinstance(repo, RepositorioPostgres):
         # Sessão de escrita com o usuário da aplicação: a negação vem da permissão (InsufficientPrivilege), não
         # do modo somente leitura que a API usa, que barraria o update e o delete antes.
@@ -236,71 +281,46 @@ async def test_aplicacao_nao_le_nem_altera_a_movimentacao(repo: RepositorioLista
             password=s.pg_password.get_secret_value(),
             connect_timeout=5,
         ) as conexao:
-            for sql in ACESSOS_NEGADOS_POSTGRES:
-                with pytest.raises(psycopg.errors.InsufficientPrivilege):
-                    conexao.execute(sql)
-                conexao.rollback()
+            for tabela in ("credito.movimentacao", "credito.log_erros"):
+                for sql in ACESSOS_NEGADOS:
+                    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                        conexao.execute(sql.format(t=tabela))
+                    conexao.rollback()
         return
-    for sql in ACESSOS_NEGADOS_ORACLE:
-        with pytest.raises(oracledb.DatabaseError):  # ORA-00942: sem privilégio nem sinônimo
-            await repo._consultar(sql, {})  # type: ignore[attr-defined]
+    for tabela in ("movimentacao", "log_erros"):
+        for sql in ACESSOS_NEGADOS:
+            with pytest.raises(oracledb.DatabaseError):  # ORA-01031: sem privilégio
+                await repo._consultar(sql.format(t=tabela), {})  # type: ignore[attr-defined]
 
 
-async def test_grava_log_de_erros_com_a_chave_da_movimentacao_mas_nao_le(
-    repo: RepositorioListas, limpeza: list[tuple[int, int]]
-) -> None:
-    # A aplicação só tem INSERT em log_erros: gravar funciona, ler é negado (sessão de leitura comum).
-    ano, numero = await repo.registrar_requisicao("POST", "/api/v1/triagem", "{}")
-    limpeza.append((ano, numero))
-    await repo.gravar_erros(
-        [
-            RegistroErro(
-                ano,
-                numero,
-                "teste-bancos-1",
-                "POST",
-                "/api/v1/triagem",
-                422,
-                "entrada_invalida",
-                "Dados inválidos.",
-                None,
-                5,
-                "teste",
-            ),
-            RegistroErro(
-                ano,
-                numero,
-                "teste-bancos-2",
-                "GET",
-                "/x",
-                500,
-                "erro_interno",
-                "Erro interno.",
-                "builtins.RuntimeError",
-                None,
-                "teste",
-            ),
-        ]
-    )
-
-    linhas = _admin(
-        repo, "select ano, requisicao, codigo from {l} where ano = ? and requisicao = ? order by id", ano, numero
-    )
-    assert [(a, r, c) for a, r, c in linhas] == [(ano, numero, "entrada_invalida"), (ano, numero, "erro_interno")]
-
-    postgres = isinstance(repo, RepositorioPostgres)
-    with pytest.raises(Exception):  # noqa: B017, PT011 - permissão negada, cada driver com sua exceção
-        await repo._consultar(  # type: ignore[attr-defined]
-            "select count(*) from credito.log_erros" if postgres else "select count(*) from log_erros",
-            () if postgres else {},
-        )
-
-
-async def test_log_de_erros_recusa_erro_sem_movimentacao(repo: RepositorioListas) -> None:
-    # Chave que não existe na movimentação: o banco recusa (chave estrangeira); nunca grava linha solta.
-    inexistente = RegistroErro(
-        ANO_ATUAL, 999_999_999, "teste-bancos-x", "GET", "/x", 500, "erro_interno", "Erro interno.", None, None, "teste"
-    )
-    with pytest.raises(Exception):  # noqa: B017, PT011 - violação de chave estrangeira, cada driver com a sua
-        await repo.gravar_erros([inexistente])
+async def test_log_de_erros_recusa_linha_sem_movimentacao(repo: RepositorioListas) -> None:
+    # Chave que não existe na movimentação: o banco recusa (chave estrangeira); nunca fica linha solta.
+    inexistente = ulid.novo()
+    colunas = "(requisicao_id, request_id, metodo, rota, status, codigo, titulo, ambiente)"
+    valores = "'teste-bancos-x', 'GET', '/x', 500, 'erro_interno', 'Erro interno.', 'teste'"
+    if isinstance(repo, RepositorioPostgres):
+        s = _settings()
+        with (
+            psycopg.connect(
+                host=s.pg_host,
+                port=s.pg_port,
+                dbname=s.pg_database,
+                user=s.pg_user,
+                password=s.pg_password.get_secret_value(),
+                connect_timeout=5,
+            ) as conexao,
+            pytest.raises(psycopg.errors.ForeignKeyViolation),
+        ):
+            conexao.execute(
+                f"insert into credito.log_erros {colunas} values (%s, {valores})",
+                (inexistente,),
+            )
+    else:
+        with pytest.raises(oracledb.DatabaseError):  # ORA-02291: chave pai não encontrada
+            async with repo._pool.acquire() as conexao:  # type: ignore[attr-defined]
+                with conexao.cursor() as cursor:
+                    await cursor.execute(
+                        f"insert into log_erros {colunas} values (:1, {valores})",
+                        [inexistente],
+                    )
     assert _admin(repo, "select count(*) from {l} where request_id = ?", "teste-bancos-x") == [(0,)]

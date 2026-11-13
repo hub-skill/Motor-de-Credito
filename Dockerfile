@@ -34,6 +34,8 @@ EXPOSE 8080
 # processo abre o próprio pool (PG_POOL_MAX/ORACLE_POOL_MAX) e o próprio rate limit.
 # Tempos em escada: banco (5 s) < REQUEST_TIMEOUT_SECONDS (10) < --timeout (15) < --graceful-timeout (20).
 # No Linux o loop padrão do uvicorn já funciona com o psycopg async (o --loop do Windows não é preciso).
+# --no-control-socket: o gunicorn 25+ tenta criar um socket de controle em ~/.gunicorn; o usuário da imagem não tem home e
+# o log mostraria "Control server error: Permission denied" a cada subida (sem efeito na API, mas é ruído).
 CMD ["gunicorn", "app.main:app", "-k", "uvicorn_worker.UvicornWorker", \
      "-b", "0.0.0.0:8080", "--timeout", "15", "--graceful-timeout", "20", "--keep-alive", "5", \
-     "--worker-tmp-dir", "/dev/shm", "--access-logfile", "-"]
+     "--worker-tmp-dir", "/dev/shm", "--access-logfile", "-", "--no-control-socket"]
