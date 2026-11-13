@@ -1,20 +1,17 @@
 """Repositório Oracle (python-oracledb thin, async + pool). MOTOR_APP lê pelos sinônimos."""
 
-from dataclasses import asdict
 from datetime import datetime
 
 import oracledb
 
 from app.core.config import Settings
+from app.movimentacao.oracle import MovimentacaoOracle
 from app.repositorios.base import (
-    SQL_LOG_ERROS,
     SQL_ORIGEM,
     SQL_PEPS,
     SQL_SANCOES,
     OrigemDados,
-    RegistroErro,
     RegistroPep,
-    RegistroResposta,
     Sancao,
 )
 from app.repositorios.erros_oracle import traduzir_erros_oracle
@@ -29,6 +26,7 @@ class RepositorioOracle:
     def __init__(self, pool: oracledb.AsyncConnectionPool, call_timeout_ms: int) -> None:
         self._pool = pool
         self._timeout = call_timeout_ms
+        self._movimentacao = MovimentacaoOracle(pool, call_timeout_ms)
 
     @classmethod
     async def criar(cls, s: Settings) -> "RepositorioOracle":
@@ -83,51 +81,9 @@ class RepositorioOracle:
     async def verificar(self) -> None:
         await self._consultar("select 1 from dual", {})
 
-    async def gravar_erros(self, registros: list[RegistroErro]) -> None:
-        sql = SQL_LOG_ERROS.format(
-            tabela="log_erros",  # sinônimo do MOTOR_APP para MOTOR_CREDITO.LOG_ERROS
-            params=(
-                ":ano, :requisicao, :request_id, :metodo, :rota, :status, :codigo, :titulo, :tipo_excecao,"
-                " :duracao_ms, :ambiente"
-            ),
-        )
-        with traduzir_erros_oracle():
-            async with self._pool.acquire() as conn:
-                conn.call_timeout = self._timeout
-                with conn.cursor() as cur:
-                    await cur.executemany(sql, [asdict(r) for r in registros])
-                await conn.commit()
-
-    async def registrar_requisicao(self, metodo: str, rota: str, conteudo: str | None) -> tuple[int, int]:
-        # Procedure do dono (MOTOR_CREDITO) pelo sinônimo: o MOTOR_APP só tem EXECUTE nela.
-        with traduzir_erros_oracle():
-            async with self._pool.acquire() as conn:
-                conn.call_timeout = self._timeout
-                with conn.cursor() as cur:
-                    ano = cur.var(int)
-                    numero = cur.var(int)
-                    await cur.callproc("registrar_requisicao", [metodo, rota, await _clob(conn, conteudo), ano, numero])
-                await conn.commit()
-        return int(ano.getvalue()), int(numero.getvalue())
-
-    async def registrar_respostas(self, registros: list[RegistroResposta]) -> None:
-        with traduzir_erros_oracle():
-            async with self._pool.acquire() as conn:
-                conn.call_timeout = self._timeout
-                with conn.cursor() as cur:
-                    for r in registros:
-                        parametros: list[object] = [r.ano, r.requisicao, r.status_http, await _clob(conn, r.conteudo)]
-                        parametros += [r.situacao_requisicao, r.situacao_resposta]
-                        await cur.callproc("registrar_resposta", parametros)
-                await conn.commit()
+    @property
+    def movimentacao(self) -> MovimentacaoOracle:
+        return self._movimentacao
 
     async def fechar(self) -> None:
         await self._pool.close(force=True)
-
-
-async def _clob(conn: oracledb.AsyncConnection, texto: str | None) -> oracledb.AsyncLOB | None:
-    """Texto como CLOB temporário: sem isto, um texto acima de 32767 bytes não passa como parâmetro de procedure."""
-    if texto is None:
-        return None
-    lob: oracledb.AsyncLOB = await conn.createlob(oracledb.DB_TYPE_CLOB, texto)
-    return lob

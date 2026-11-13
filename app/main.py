@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import time
 import uuid
@@ -21,16 +20,9 @@ from app.core.exceptions import ErroDeDominio
 from app.core.limiter import limiter
 from app.core.logging import configurar_logs
 from app.core.profundidade_json import corpo_json_ilegivel
-from app.repositorios.base import RegistroErro, RegistroResposta, RepositorioListas
-from app.services.log_erros import GravadorDeErros
-from app.services.movimentacao import (
-    PRAZO_PARA_NUMERAR_SEGUNDOS,
-    GravadorDeRespostas,
-    conteudo_para_gravar,
-    movimentar,
-    numero_formatado,
-    situacoes,
-)
+from app.movimentacao.http import Movimentacao, registrar_erro
+from app.movimentacao.regras import conteudo_da_requisicao, movimentar
+from app.repositorios.base import RepositorioListas
 
 configurar_logs()
 logger = logging.getLogger(__name__)
@@ -53,17 +45,14 @@ async def criar_repositorio(s: Settings) -> RepositorioListas:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.repositorio = await criar_repositorio(settings)
-    app.state.gravador_erros = GravadorDeErros(app.state.repositorio)
-    app.state.gravador_erros.iniciar()
-    app.state.gravador_respostas = GravadorDeRespostas(app.state.repositorio)
-    app.state.gravador_respostas.iniciar()
+    app.state.movimentacao = Movimentacao(app.state.repositorio.movimentacao, settings.app_env)
+    app.state.movimentacao.iniciar()
     logger.info("api iniciada", extra={"banco": settings.motor_banco, "ambiente": settings.app_env})
     try:
         yield
     finally:
-        # Grava o que ainda estiver nas filas antes de fechar o pool.
-        await app.state.gravador_respostas.parar()
-        await app.state.gravador_erros.parar()
+        # Grava o que ainda estiver na fila antes de fechar o pool.
+        await app.state.movimentacao.parar()
         await app.state.repositorio.fechar()
 
 
@@ -106,7 +95,7 @@ def _resposta_erro(
 
     Corpo sempre com exatamente `title`, `status`, `code` e `request_id` (sem `type`: ausente = about:blank).
     """
-    _registrar_erro(request, status_code, codigo, mensagem, tipo_excecao)
+    registrar_erro(request, status_code, codigo, mensagem, tipo_excecao)  # grava junto com a movimentação
     return JSONResponse(
         status_code=status_code,
         content={
@@ -118,79 +107,6 @@ def _resposta_erro(
         headers=headers,
         media_type="application/problem+json",
     )
-
-
-def _registrar_erro(request: Request, status: int, codigo: str, titulo: str, tipo_excecao: str | None) -> None:
-    """Põe o erro na fila da tabela log_erros (sem esperar o banco). Só metadados: nunca o corpo da requisição.
-
-    Sem número de requisição (rota sem movimentação ou banco fora na chegada), o erro não vai para a tabela:
-    a log_erros nunca tem linha sem (ano, requisicao).
-    """
-    gravador: GravadorDeErros | None = getattr(request.app.state, "gravador_erros", None)
-    numero: tuple[int, int] | None = getattr(request.state, "movimentacao", None)
-    if gravador is None or numero is None:
-        return
-    inicio: float | None = getattr(request.state, "inicio", None)
-    gravador.registrar(
-        RegistroErro(
-            ano=numero[0],
-            requisicao=numero[1],
-            request_id=str(getattr(request.state, "request_id", "") or "-"),
-            metodo=request.method[:10],
-            rota=request.url.path[:200],
-            status=status,
-            codigo=codigo[:40],
-            titulo=titulo[:200],
-            tipo_excecao=tipo_excecao[:200] if tipo_excecao else None,
-            duracao_ms=round((time.perf_counter() - inicio) * 1000) if inicio is not None else None,
-            ambiente=settings.app_env[:20],
-        )
-    )
-
-
-async def _numerar_requisicao(request: Request, conteudo: str | None) -> None:
-    """Grava a chegada na movimentação e guarda (ano, requisicao) em request.state.movimentacao.
-
-    Espera o banco no máximo PRAZO_PARA_NUMERAR_SEGUNDOS: sem número, a requisição segue sem movimentação.
-    """
-    repo: RepositorioListas | None = getattr(request.app.state, "repositorio", None)
-    if repo is None:
-        return
-    try:
-        async with asyncio.timeout(PRAZO_PARA_NUMERAR_SEGUNDOS):
-            request.state.movimentacao = await repo.registrar_requisicao(
-                request.method[:10], request.url.path[:200], conteudo
-            )
-    except Exception as exc:  # noqa: BLE001 - sem número a API continua respondendo
-        logger.warning("requisição sem número na movimentação", extra={"erro": type(exc).__name__})
-
-
-async def _completar_movimentacao(request: Request, response: Response) -> Response:
-    """Põe a resposta na fila da movimentação (sem esperar o banco) e devolve o número no header X-Requisicao."""
-    numero: tuple[int, int] | None = getattr(request.state, "movimentacao", None)
-    if numero is None:
-        return response
-    iterador = getattr(response, "body_iterator", None)
-    if iterador is None:
-        corpo = bytes(response.body)
-    else:  # resposta da rota (streaming): lê o corpo (pequeno) e devolve uma cópia com o mesmo conteúdo
-        corpo = b"".join([parte if isinstance(parte, bytes) else parte.encode() async for parte in iterador])
-        response = Response(content=corpo, status_code=response.status_code, headers=dict(response.headers))
-    gravador: GravadorDeRespostas | None = getattr(request.app.state, "gravador_respostas", None)
-    if gravador is not None:
-        situacao_requisicao, situacao_resposta = situacoes(response.status_code)
-        gravador.registrar(
-            RegistroResposta(
-                ano=numero[0],
-                requisicao=numero[1],
-                status_http=response.status_code,
-                conteudo=conteudo_para_gravar(corpo),
-                situacao_requisicao=situacao_requisicao,
-                situacao_resposta=situacao_resposta,
-            )
-        )
-    response.headers["X-Requisicao"] = numero_formatado(*numero)
-    return response
 
 
 @app.middleware("http")
@@ -205,13 +121,10 @@ async def contexto_da_requisicao(request: Request, call_next: Callable[[Request]
     chave_ok = chave_valida(request.headers.get("X-API-Key"), get_settings())
     corpo = b"" if grande or not chave_ok else await request.body()  # fica em cache para a rota
 
-    # Movimentação: numera e grava a chegada antes de tudo (inclusive dos erros 4xx), menos /health e /metrics.
-    movimenta = chave_ok and movimentar(request.url.path)
-    if movimenta:
-        conteudo = (
-            f"(corpo de {tamanho} bytes, acima do limite: não gravado)" if grande else conteudo_para_gravar(corpo)
-        )
-        await _numerar_requisicao(request, conteudo)
+    # Movimentação: o ULID nasce aqui, na API (sem banco), inclusive para os erros 4xx; menos /health e /metrics.
+    movimentacao = Movimentacao.da(request) if chave_ok and movimentar(request.url.path) else None
+    if movimentacao:
+        movimentacao.abrir(request, conteudo_da_requisicao(corpo, tamanho, grande))
 
     if grande:
         response: Response = _resposta_erro(request, 413, "corpo_muito_grande", "Corpo da requisição excede o limite.")
@@ -230,8 +143,8 @@ async def contexto_da_requisicao(request: Request, call_next: Callable[[Request]
         except Exception as exc:  # noqa: BLE001 - erro não tratado: o 500 sai daqui para entrar na movimentação
             response = await tratar_erro_inesperado(request, exc)
 
-    if movimenta:
-        response = await _completar_movimentacao(request, response)
+    if movimentacao:
+        response = await movimentacao.completar(request, response)
     response.headers["X-Request-ID"] = request.state.request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"

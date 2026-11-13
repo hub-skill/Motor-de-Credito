@@ -117,7 +117,7 @@ def link(texto: str, url: str) -> None:
 # ---------------------------------------------------------------- Capa / resumo
 p("Motor de Crédito – Base de Conhecimento", "titulo")
 p("Pesquisa, decisões e plano para a API Serasa e para o motor de crédito de venda parcelada. "
-  "Compilado em 10/11/2026.", "sub")
+  "Compilado em 10/11/2026; registro das chamadas atualizado em 13/11/2026.", "sub")
 
 h1("Resumo")
 itens([
@@ -366,6 +366,10 @@ itens([
     "registra a versão que a tomou.",
     "<b>Toda decisão gravada</b> com entrada, dados, versões e motivos: alimenta backtest (#7), "
     "A/B (#8) e auditoria (#10).",
+    "<b>Registro das chamadas (já implementado na API de triagem, 13/11/2026):</b> cada requisição com chave "
+    "de API válida recebe um identificador <b>ULID</b> gerado na própria API (header <b>X-Requisicao</b>) e é "
+    "gravada, com a resposta e o erro, numa só gravação em segundo plano (tabelas <b>movimentacao</b> e "
+    "<b>log_erros</b>), com o CPF mascarado. É a base do registro de decisões acima.",
     "Mesmo padrão do projeto Serasa: FastAPI, API key, rate limit, timeouts, logs sem dado pessoal, "
     "testes automatizados.",
     "Sugestão: motor como projeto próprio nesta pasta, com a API Serasa como uma de suas fontes.",

@@ -33,7 +33,7 @@ CREATE TABLE motor_credito.sancoes (
     origem_informacao        VARCHAR2(150),
     observacoes              CLOB,
     arquivo_origem           VARCHAR2(60)   NOT NULL,
-    carregado_em             TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+    carregado_em             TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
 
     CONSTRAINT pk_sancoes                 PRIMARY KEY (id),
     CONSTRAINT uk_sancoes_cadastro_codigo UNIQUE (cadastro, codigo_sancao),
@@ -115,7 +115,7 @@ CREATE TABLE motor_credito.peps (
     data_fim_exercicio     DATE,
     data_fim_carencia      DATE,
     arquivo_origem         VARCHAR2(60)   NOT NULL,
-    carregado_em           TIMESTAMP      DEFAULT SYSTIMESTAMP NOT NULL,
+    carregado_em           TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
 
     CONSTRAINT pk_peps PRIMARY KEY (id)
 )
